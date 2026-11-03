@@ -12,6 +12,7 @@
 | `apps/server/src/agent/prompt.ts` | Planner system prompt (appended to the Claude Code preset), coder subagent definition, tool allow-lists. |
 | `apps/server/src/providers/azure-devops.ts` | Repos, initial commit, branch policies, PRs, threads, policy evaluations, pipelines. |
 | `apps/server/src/providers/kubernetes.ts` | Image builds (in-cluster Kaniko, or local Docker + kind/k3d/minikube load), namespaces + guard rails, addons, rollout wait, logs, TTL reaper. |
+| `apps/server/src/integrations/port/` | Port: REST client, entity mapping, debounced catalog sync, planner tools, signed action receiver. |
 | `scripts/local-cluster.sh` | Local kind cluster with ingress-nginx for previews on a dev machine. |
 | `apps/web` | React UI: dashboard (grid of applications), chat, activity timeline, environments, PRs, toasts and browser notifications. |
 

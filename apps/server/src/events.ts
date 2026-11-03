@@ -49,8 +49,15 @@ export function publish(
   const evt: BlackboxEvent = { seq, appId, runId, type, payload, createdAt };
   const app = one<Pick<AppRow, 'owner_id'>>('SELECT owner_id FROM applications WHERE id = ?', appId);
   if (app) bus.emit(`user:${app.owner_id}`, evt);
+  bus.emit('*', evt);
   if (type === 'notification') void forwardToWebhook(appId, payload);
   return evt;
+}
+
+/** Every event of every application (integrations such as the Port catalog sync). */
+export function subscribeAll(fn: (e: BlackboxEvent) => void) {
+  bus.on('*', fn);
+  return () => bus.off('*', fn);
 }
 
 export function subscribe(userId: string, fn: (e: BlackboxEvent) => void) {

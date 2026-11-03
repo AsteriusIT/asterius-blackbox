@@ -1,0 +1,150 @@
+{
+  "identifier": "blackboxApplication",
+  "title": "Blackbox Application",
+  "icon": "Microservice",
+  "schema": {
+    "properties": {
+      "description": {
+        "title": "Description",
+        "type": "string",
+        "format": "markdown"
+      },
+      "status": {
+        "title": "Status",
+        "type": "string",
+        "enum": [
+          "provisioning",
+          "ready",
+          "running",
+          "idle",
+          "error"
+        ],
+        "enumColors": {
+          "provisioning": "lightGray",
+          "ready": "blue",
+          "running": "turquoise",
+          "idle": "green",
+          "error": "red"
+        }
+      },
+      "phase": {
+        "title": "Phase",
+        "type": "string",
+        "enum": [
+          "understanding",
+          "planning",
+          "implementing",
+          "testing",
+          "deploying",
+          "reviewing",
+          "done",
+          "blocked"
+        ],
+        "enumColors": {
+          "understanding": "lightGray",
+          "planning": "paleBlue",
+          "implementing": "blue",
+          "testing": "purple",
+          "deploying": "orange",
+          "reviewing": "yellow",
+          "done": "green",
+          "blocked": "red"
+        }
+      },
+      "last_progress": {
+        "title": "Latest update",
+        "type": "string"
+      },
+      "last_error": {
+        "title": "Last error",
+        "type": "string"
+      },
+      "chat_url": {
+        "title": "Open in Blackbox",
+        "type": "string",
+        "format": "url"
+      },
+      "repository_url": {
+        "title": "Repository",
+        "type": "string",
+        "format": "url"
+      },
+      "live_preview_url": {
+        "title": "Live preview",
+        "type": "string",
+        "format": "url"
+      },
+      "requested_by": {
+        "title": "Requested by",
+        "type": "string",
+        "format": "user"
+      },
+      "planner_model": {
+        "title": "Planner model",
+        "type": "string"
+      },
+      "coder_model": {
+        "title": "Coder model",
+        "type": "string"
+      },
+      "total_cost_usd": {
+        "title": "Agent cost (USD)",
+        "type": "number"
+      },
+      "runs": {
+        "title": "Agent runs",
+        "type": "number"
+      },
+      "open_prs": {
+        "title": "Changes waiting for approval",
+        "type": "number"
+      },
+      "last_activity": {
+        "title": "Last activity",
+        "type": "string",
+        "format": "date-time"
+      },
+      "created_at": {
+        "title": "Created",
+        "type": "string",
+        "format": "date-time"
+      }
+    },
+    "required": []
+  },
+  "aggregationProperties": {
+    "live_previews": {
+      "title": "Live previews",
+      "type": "number",
+      "target": "previewEnvironment",
+      "calculationSpec": {
+        "calculationBy": "entities",
+        "func": "count"
+      },
+      "query": {
+        "combinator": "and",
+        "rules": [
+          {
+            "property": "status",
+            "operator": "=",
+            "value": "ready"
+          }
+        ]
+      }
+    }
+  },
+  "relations": {
+    "service": {
+      "title": "Service",
+      "target": "service",
+      "required": false,
+      "many": false
+    },
+    "repository": {
+      "title": "Repository",
+      "target": "azureDevopsRepository",
+      "required": false,
+      "many": false
+    }
+  }
+}

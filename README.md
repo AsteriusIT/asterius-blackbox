@@ -56,6 +56,10 @@ PUBLIC_URL=https://blackbox.example.com scripts/entra-app.sh   # later: add the 
 - **Consent:** without admin consent, each user approves the basic profile permissions (openid, profile, email, User.Read) on first sign-in. An admin can grant consent once in the portal.
 - **Secret rotation:** `ROTATE_SECRET=1 scripts/entra-app.sh` creates a new one-year secret. Never commit `.env`.
 
+## Port (developer portal)
+
+Blackbox publishes every application, its preview environments and its live status to [Port](https://port.io). It also creates a `service` per app, so your scorecards and DORA metrics apply to generated apps. The planner reads your production-readiness scorecards and the existing catalog while planning. Self-service actions (create an app or send feedback from Port) are implemented and switch on once Port can reach Blackbox. See [deploy/port/README.md](deploy/port/README.md).
+
 ## The agent: plan, then code
 
 | | Model (env) | Role | Tools |

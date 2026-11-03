@@ -97,6 +97,21 @@ const schema = z.object({
   K8S_CLUSTER_ISSUER: z.string().optional(),
   K8S_ENV_TTL_HOURS: z.coerce.number().default(72),
 
+  // ---- Port (getport.io) ----
+  /** Port API credentials (Port → ... → Credentials). When set, Blackbox syncs its catalog to Port. */
+  PORT_CLIENT_ID: z.string().optional(),
+  PORT_CLIENT_SECRET: z.string().optional(),
+  /** EU: https://api.port.io — US: https://api.us.port.io */
+  PORT_API_URL: z.string().default('https://api.port.io'),
+  /** Also create/update a `service` entity per application (scorecards, ownership, DORA). */
+  PORT_SYNC_SERVICES: bool(true),
+  /** Port team used as owner when the requester has no Port team. */
+  PORT_DEFAULT_TEAM: z.string().optional(),
+  /** Give the planner read-only Port tools (existing services, production-readiness scorecards). */
+  PORT_AGENT_CONTEXT: bool(true),
+  /** Accept self-service action webhooks from Port (needs Blackbox reachable by Port, or the Port execution agent). */
+  PORT_ACTIONS_ENABLED: bool(false),
+
   // ---- Notifications ----
   /** Optional incoming webhook (Teams / Slack compatible JSON `{text}`) for "environment ready" etc. */
   NOTIFY_WEBHOOK_URL: z.string().optional(),

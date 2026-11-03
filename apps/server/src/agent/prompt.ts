@@ -2,6 +2,7 @@ import type { AgentDefinition } from '@anthropic-ai/claude-agent-sdk';
 import { config } from '../config.js';
 import type { AppRow } from '../db.js';
 import { gitProvider } from '../providers/git.js';
+import { portAgentToolsEnabled } from '../integrations/port/agent-tools.js';
 
 /**
  * Two-step agent:
@@ -42,6 +43,15 @@ Kubernetes previews are disabled on this platform. Have the coder verify the app
 - Nobody has kubectl access; these tools are the only way to touch the cluster.`;
 }
 
+function portSection() {
+  if (!portAgentToolsEnabled()) return '';
+  return `## Developer portal (Port)
+The organization tracks services in Port. During planning:
+- call \`mcp__blackbox__port_find_services\` with a keyword or two from the request, to avoid duplicating an existing service and to reuse what exists;
+- call \`mcp__blackbox__port_production_standards\` and turn the rules you can influence into acceptance criteria in your plan (README, CI pipeline, small PRs, green builds). Mention in the plan, in one line, that the app is built to meet the organization's production standards.
+The platform already links the repository, sets the owning team and enforces reviewers; it also publishes the application, its previews and its status to Port automatically.`;
+}
+
 export function systemPromptAppend(app: AppRow): string {
   const approval = config.AGENT_REQUIRE_PLAN_APPROVAL
     ? 'After `share_plan`, stop and wait for the user to confirm before building anything.'
@@ -71,6 +81,8 @@ Keep going until the request is fully delivered and verified. Bash is for inspec
 ${repoRules()}
 
 ${environmentsSection()}
+
+${portSection()}
 
 ## Keeping the user informed
 - Call \`mcp__blackbox__report_progress\` at each phase (understanding → planning → implementing → testing → deploying → reviewing → done) and after milestones. Use one or two plain sentences, e.g. "Members can now sign in. Next: the loans page."

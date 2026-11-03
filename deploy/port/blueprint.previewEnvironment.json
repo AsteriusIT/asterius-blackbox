@@ -1,0 +1,67 @@
+{
+  "identifier": "previewEnvironment",
+  "title": "Preview Environment",
+  "icon": "Environment",
+  "schema": {
+    "properties": {
+      "url": {
+        "title": "URL",
+        "type": "string",
+        "format": "url"
+      },
+      "status": {
+        "title": "Status",
+        "type": "string",
+        "enum": [
+          "building",
+          "deploying",
+          "ready",
+          "failed",
+          "deleted"
+        ],
+        "enumColors": {
+          "building": "blue",
+          "deploying": "paleBlue",
+          "ready": "green",
+          "failed": "red",
+          "deleted": "lightGray"
+        }
+      },
+      "branch": {
+        "title": "Branch",
+        "type": "string"
+      },
+      "commit": {
+        "title": "Commit",
+        "type": "string"
+      },
+      "namespace": {
+        "title": "Kubernetes namespace",
+        "type": "string"
+      },
+      "message": {
+        "title": "Message",
+        "type": "string"
+      },
+      "expires_at": {
+        "title": "Expires",
+        "type": "string",
+        "format": "date-time"
+      },
+      "updated_at": {
+        "title": "Updated",
+        "type": "string",
+        "format": "date-time"
+      }
+    },
+    "required": []
+  },
+  "relations": {
+    "application": {
+      "title": "Application",
+      "target": "blackboxApplication",
+      "required": false,
+      "many": false
+    }
+  }
+}

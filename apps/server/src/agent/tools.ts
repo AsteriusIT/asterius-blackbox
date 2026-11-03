@@ -6,6 +6,7 @@ import { notify, publish } from '../events.js';
 import { addMessage } from './messages.js';
 import { exec, gitProvider, type RepoInfo } from '../providers/git.js';
 import { kube, type Addon } from '../providers/kubernetes.js';
+import { portAgentTools, portAgentToolsEnabled } from '../integrations/port/agent-tools.js';
 
 export interface ToolContext {
   app: AppRow;
@@ -297,6 +298,7 @@ export function blackboxTools(ctx: ToolContext) {
           }
         },
       ),
+      ...(portAgentToolsEnabled() ? portAgentTools() : []),
     ].filter((t) => config.K8S_ENABLED || !K8S_TOOLS.has(t.name)),
   });
 }

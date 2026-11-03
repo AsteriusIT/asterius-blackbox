@@ -1,23 +1,15 @@
 import type { FastifyInstance } from 'fastify';
-import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import { config } from '../config.js';
 import { all, newId, one, run, upsertEnv, type AppRow, type EnvRow, type EventRow, type MessageRow, type PullRequestRow, type UserRow } from '../db.js';
 import { publish, subscribe } from '../events.js';
 import { createSession, createUser, deleteSession, publicUser, requireUser, verifyPassword } from '../auth.js';
 import { entraRoutes } from '../entra.js';
+import { createApplication } from '../applications.js';
+import { portSyncStatus } from '../integrations/port/sync.js';
 import { addMessage, isRunning, provisionApp, queueBeforeReady, sendUserMessage, stopRun } from '../agent/runner.js';
 import { gitProvider } from '../providers/git.js';
 import { kube } from '../providers/kubernetes.js';
-
-const slugify = (s: string) =>
-  s.toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 24) || 'app';
-
-function uniqueSlug(name: string) {
-  const base = slugify(name);
-  if (!one('SELECT 1 FROM applications WHERE slug = ?', base)) return base;
-  return `${base.slice(0, 19)}-${randomBytes(2).toString('hex')}`;
-}
 
 function ownApp(userId: string, id: string) {
   return one<AppRow>('SELECT * FROM applications WHERE id = ? AND owner_id = ?', id, userId);
@@ -56,6 +48,7 @@ export async function apiRoutes(app: FastifyInstance) {
     coderModel: config.AGENT_CODER_MODEL,
     buildMode: config.K8S_BUILD_MODE,
     authProviders: config.AUTH_PROVIDERS,
+    port: { ...portSyncStatus, actions: config.PORT_ACTIONS_ENABLED },
     allowRegistration: localAuth && config.ALLOW_REGISTRATION,
   }));
 
@@ -89,12 +82,7 @@ export async function apiRoutes(app: FastifyInstance) {
       const body = z
         .object({ name: z.string().min(2).max(60), description: z.string().max(4000).default(''), prompt: z.string().min(1).max(20000) })
         .parse(req.body);
-      const id = newId();
-      run('INSERT INTO applications (id, owner_id, name, slug, description) VALUES (?, ?, ?, ?, ?)', id, req.user.id, body.name, uniqueSlug(body.name), body.description);
-      const created = one<AppRow>('SELECT * FROM applications WHERE id = ?', id)!;
-      sendUserMessage(created, body.prompt); // queued until the repository exists
-      void provisionApp(id);
-      return appView(created);
+      return appView(createApplication(req.user.id, body));
     });
 
     r.get('/api/apps/:id', async (req, reply) => {

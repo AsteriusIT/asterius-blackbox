@@ -1,0 +1,156 @@
+[
+  {
+    "identifier": "blackbox_create_application",
+    "title": "Create application with Blackbox",
+    "icon": "Microservice",
+    "description": "Describe an application; the Blackbox agent plans it, builds it in Azure DevOps and publishes a preview.",
+    "trigger": {
+      "type": "self-service",
+      "operation": "CREATE",
+      "blueprintIdentifier": "blackboxApplication",
+      "userInputs": {
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 60
+          },
+          "description": {
+            "title": "Short description",
+            "type": "string"
+          },
+          "prompt": {
+            "title": "What should be built?",
+            "description": "Who it is for, what they should be able to do, anything that matters.",
+            "type": "string",
+            "format": "multi-line"
+          }
+        },
+        "required": [
+          "name",
+          "prompt"
+        ],
+        "order": [
+          "name",
+          "description",
+          "prompt"
+        ]
+      }
+    },
+    "invocationMethod": {
+      "type": "WEBHOOK",
+      "url": "https://BLACKBOX_PUBLIC_URL/api/integrations/port/webhook",
+      "agent": false,
+      "synchronized": false,
+      "method": "POST",
+      "body": {
+        "action": "create_app",
+        "runId": "{{ .run.id }}",
+        "user": "{{ .trigger.by.user.email }}",
+        "inputs": {
+          "name": "{{ .inputs.name }}",
+          "description": "{{ .inputs.description // \"\" }}",
+          "prompt": "{{ .inputs.prompt }}"
+        }
+      }
+    },
+    "requiredApproval": false
+  },
+  {
+    "identifier": "blackbox_send_feedback",
+    "title": "Send feedback to the agent",
+    "icon": "Microservice",
+    "description": "Ask for a change or give feedback; the agent picks it up (even while working).",
+    "trigger": {
+      "type": "self-service",
+      "operation": "DAY-2",
+      "blueprintIdentifier": "blackboxApplication",
+      "userInputs": {
+        "properties": {
+          "message": {
+            "title": "Your message",
+            "type": "string",
+            "format": "multi-line"
+          }
+        },
+        "required": [
+          "message"
+        ]
+      }
+    },
+    "invocationMethod": {
+      "type": "WEBHOOK",
+      "url": "https://BLACKBOX_PUBLIC_URL/api/integrations/port/webhook",
+      "agent": false,
+      "synchronized": false,
+      "method": "POST",
+      "body": {
+        "action": "send_feedback",
+        "runId": "{{ .run.id }}",
+        "user": "{{ .trigger.by.user.email }}",
+        "entity": "{{ .entity.identifier }}",
+        "inputs": {
+          "message": "{{ .inputs.message }}"
+        }
+      }
+    },
+    "requiredApproval": false
+  },
+  {
+    "identifier": "blackbox_stop_agent",
+    "title": "Stop the agent",
+    "icon": "Microservice",
+    "trigger": {
+      "type": "self-service",
+      "operation": "DAY-2",
+      "blueprintIdentifier": "blackboxApplication",
+      "userInputs": {
+        "properties": {},
+        "required": []
+      }
+    },
+    "invocationMethod": {
+      "type": "WEBHOOK",
+      "url": "https://BLACKBOX_PUBLIC_URL/api/integrations/port/webhook",
+      "agent": false,
+      "synchronized": false,
+      "method": "POST",
+      "body": {
+        "action": "stop_agent",
+        "runId": "{{ .run.id }}",
+        "user": "{{ .trigger.by.user.email }}",
+        "entity": "{{ .entity.identifier }}"
+      }
+    },
+    "requiredApproval": false
+  },
+  {
+    "identifier": "blackbox_delete_preview",
+    "title": "Delete preview",
+    "icon": "Environment",
+    "trigger": {
+      "type": "self-service",
+      "operation": "DELETE",
+      "blueprintIdentifier": "previewEnvironment",
+      "userInputs": {
+        "properties": {},
+        "required": []
+      }
+    },
+    "invocationMethod": {
+      "type": "WEBHOOK",
+      "url": "https://BLACKBOX_PUBLIC_URL/api/integrations/port/webhook",
+      "agent": false,
+      "synchronized": false,
+      "method": "POST",
+      "body": {
+        "action": "delete_preview",
+        "runId": "{{ .run.id }}",
+        "user": "{{ .trigger.by.user.email }}",
+        "entity": "{{ .entity.identifier }}"
+      }
+    },
+    "requiredApproval": false
+  }
+]

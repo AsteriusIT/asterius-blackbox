@@ -9,6 +9,8 @@ import { publish } from './events.js';
 import { apiRoutes } from './routes/api.js';
 import { recoverAfterRestart } from './agent/runner.js';
 import { kube } from './providers/kubernetes.js';
+import { startPortSync } from './integrations/port/sync.js';
+import { portActionRoutes } from './integrations/port/actions.js';
 
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' } });
 
@@ -21,6 +23,7 @@ app.setErrorHandler((err, _req, reply) => {
 
 app.get('/healthz', async () => ({ ok: true }));
 await app.register(apiRoutes);
+await app.register(portActionRoutes);
 
 if (config.WEB_DIST_DIR && fs.existsSync(config.WEB_DIST_DIR)) {
   await app.register(fastifyStatic, { root: path.resolve(config.WEB_DIST_DIR), wildcard: false });
@@ -30,6 +33,7 @@ if (config.WEB_DIST_DIR && fs.existsSync(config.WEB_DIST_DIR)) {
 }
 
 recoverAfterRestart();
+startPortSync(app.log);
 
 // Reap expired environments every 15 minutes.
 if (config.K8S_ENABLED) {
