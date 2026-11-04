@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { THEME_KEY, applyTheme, getThemePref, nextThemePref, setThemePref } from '../src/lib/theme';
+import { THEME_KEY, applyTheme, getThemePref, setThemePref } from '../src/lib/theme';
 
 const mockOsDark = (dark: boolean) => vi.stubGlobal('matchMedia', (q: string) => ({ matches: dark && q.includes('dark'), addEventListener: () => undefined }));
 
@@ -31,11 +31,5 @@ describe('theme', () => {
   it('ignores garbage in storage', () => {
     localStorage.setItem(THEME_KEY, 'purple');
     expect(getThemePref()).toBe('system');
-  });
-
-  it('cycles light → dark → system', () => {
-    expect(nextThemePref('light')).toBe('dark');
-    expect(nextThemePref('dark')).toBe('system');
-    expect(nextThemePref('system')).toBe('light');
   });
 });

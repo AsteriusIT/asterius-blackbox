@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { LANGS, lang, setLang, t } from '../lib/i18n';
-import { getThemePref, nextThemePref, setThemePref, type ThemePref } from '../lib/theme';
+import { getThemePref, setThemePref, type ThemePref } from '../lib/theme';
 import type { Application, User } from '../lib/api';
 import { api, auth } from '../lib/api';
 import { phaseLabel } from '../lib/labels';
@@ -8,25 +8,76 @@ import type { Route } from '../App';
 import { Icon } from './Icon';
 import { StatusDot } from './StatusDot';
 
-const THEME_UI: Record<ThemePref, { icon: string; label: string }> = {
-  light: { icon: 'sun', label: 'Light' },
-  dark: { icon: 'moon', label: 'Dark' },
-  system: { icon: 'monitor', label: 'System' },
-};
+const THEMES: { id: ThemePref; icon: string; label: string }[] = [
+  { id: 'light', icon: 'sun', label: 'Light' },
+  { id: 'dark', icon: 'moon', label: 'Dark' },
+  { id: 'system', icon: 'monitor', label: 'System' },
+];
 
-function ThemeButton() {
-  const [pref, setPref] = useState<ThemePref>(getThemePref);
-  const cycle = () => {
-    const next = nextThemePref(pref);
-    setThemePref(next);
-    setPref(next);
+/** Account menu (⋯) in the sidebar footer: theme, language, sign out. */
+function UserMenu({ user, onSignOut }: { user: User; onSignOut: (everywhere: boolean) => void }) {
+  const [open, setOpen] = useState(false);
+  const [theme, setTheme] = useState<ThemePref>(getThemePref);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => !ref.current?.contains(e.target as Node) && setOpen(false);
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setOpen(false);
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  const pickTheme = (id: ThemePref) => {
+    setThemePref(id);
+    setTheme(id);
   };
-  const { icon, label } = THEME_UI[pref];
-  const title = t('Theme: {theme}', { theme: t(label) });
+  const other = LANGS.find((l) => l.id !== lang)!;
+
   return (
-    <button className="icon-btn" title={title} aria-label={title} onClick={cycle}>
-      <Icon name={icon} size={16} />
-    </button>
+    <div className="user-menu" ref={ref}>
+      <button
+        className={`icon-btn ${open ? 'active' : ''}`}
+        title={t('More')}
+        aria-label={t('More')}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+      >
+        <Icon name="more" size={16} />
+      </button>
+      {open && (
+        <div className="menu" role="menu">
+          <div className="menu-head">
+            <div className="menu-name">{user.name}</div>
+            <div className="menu-email">{user.email}</div>
+          </div>
+          <div className="menu-sep" />
+          <div className="menu-label">{t('Theme')}</div>
+          <div className="menu-seg" role="radiogroup" aria-label={t('Theme')}>
+            {THEMES.map((th) => (
+              <button key={th.id} role="radio" aria-checked={theme === th.id} className={theme === th.id ? 'active' : ''} onClick={() => pickTheme(th.id)}>
+                <Icon name={th.icon} size={14} /> {t(th.label)}
+              </button>
+            ))}
+          </div>
+          <button className="menu-item" role="menuitem" onClick={() => setLang(other.id)}>
+            <Icon name="globe" size={16} /> {other.label}
+          </button>
+          <div className="menu-sep" />
+          <button className="menu-item" role="menuitem" onClick={() => onSignOut(false)}>
+            <Icon name="logout" size={16} /> {t('Sign out')}
+          </button>
+          <button className="menu-item danger" role="menuitem" onClick={() => onSignOut(true)}>
+            <Icon name="logout" size={16} /> {t('Sign out everywhere')}
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -46,7 +97,7 @@ export function Sidebar({
   onDashboard: () => void;
 }) {
   const signOut = async (everywhere = false) => {
-    if (everywhere && !confirm('Sign out on every device?')) return;
+    if (everywhere && !confirm(t('Sign out on every device?'))) return;
     await (everywhere ? api.logoutAll() : api.logout()).catch(() => undefined);
     auth.set(null);
     location.href = '/login';
@@ -77,17 +128,11 @@ export function Sidebar({
       </nav>
       <div className="sidebar-foot">
         <span className="avatar">{user.name.slice(0, 1).toUpperCase()}</span>
-        <span className="sidebar-user">
+        <span className="sidebar-user" title={`${user.name}\n${user.email}`}>
           {user.name}
           <span className="sidebar-email">{user.email}</span>
         </span>
-        <ThemeButton />
-        <button className="icon-btn lang-btn" title={LANGS.find((l) => l.id !== lang)!.label} onClick={() => setLang(lang === 'fr' ? 'en' : 'fr')}>
-          {lang === 'fr' ? 'EN' : 'FR'}
-        </button>
-        <button className="icon-btn" title={t('Sign out (Shift+click: sign out everywhere)')} onClick={(e) => void signOut(e.shiftKey)}>
-          <Icon name="logout" size={16} />
-        </button>
+        <UserMenu user={user} onSignOut={(everywhere) => void signOut(everywhere)} />
       </div>
     </aside>
   );

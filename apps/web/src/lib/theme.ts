@@ -5,7 +5,6 @@
  */
 export type ThemePref = 'light' | 'dark' | 'system';
 export const THEME_KEY = 'blackbox.theme';
-const ORDER: ThemePref[] = ['light', 'dark', 'system'];
 
 const media = () => (typeof window !== 'undefined' && window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null);
 
@@ -36,8 +35,6 @@ export function setThemePref(pref: ThemePref) {
   }
   applyTheme(pref);
 }
-
-export const nextThemePref = (pref: ThemePref): ThemePref => ORDER[(ORDER.indexOf(pref) + 1) % ORDER.length];
 
 /** Apply now and keep following the OS while the preference is "system". */
 export function initTheme() {
