@@ -1,17 +1,25 @@
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { config } from '../config.js';
-import { one, run, upsertEnv, type AppRow, type EnvRow } from '../db.js';
+import { all, one, run, upsertEnv, type AppRow, type EnvRow } from '../db.js';
 import { notify, publish } from '../events.js';
-import { addMessage } from './messages.js';
-import { exec, gitProvider, type RepoInfo } from '../providers/git.js';
+import { addMessage, needsPlanApproval } from './messages.js';
+import { AGENT_COMMENT_MARK, exec, gitProvider, type RepoInfo } from '../providers/git.js';
 import { kube, type Addon } from '../providers/kubernetes.js';
+import { scanDiff } from '../security/secrets.js';
+import { configNames } from '../app-config.js';
+import { deployEnvironment } from '../environments.js';
+import { audit } from '../audit.js';
+import { withSpan } from '../tracing.js';
+import { SpanStatusCode, type Span } from '@opentelemetry/api';
 import { portAgentTools, portAgentToolsEnabled } from '../integrations/port/agent-tools.js';
 
 export interface ToolContext {
   app: AppRow;
   runId: string;
   workspace: string;
+  /** Run span: tool spans are its children (the SDK calls handlers outside the run's async context). */
+  span?: Span;
 }
 
 type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean };
@@ -32,9 +40,13 @@ function repoOf(app: AppRow): RepoInfo {
   return { repoId: app.repo_id, name: app.repo_name!, webUrl: app.repo_web_url!, cloneUrl: app.repo_clone_url };
 }
 
-async function git(ws: string, ...args: string[]) {
-  const { stdout } = await exec('git', ['-C', ws, ...args]);
-  return stdout.trim();
+/** Secret scan of what the PR would bring to main (lines added by origin/<branch> since it forked from origin/main). */
+async function scanBranch(ws: string, branch: string) {
+  await exec('git', ['-C', ws, 'fetch', '-q', 'origin', 'main', branch]).catch(() => {
+    throw new Error(`Branch "${branch}" was not found on origin: push it first.`);
+  });
+  const { stdout } = await exec('git', ['-C', ws, 'diff', '--no-color', '--unified=0', `origin/main...origin/${branch}`], { maxBuffer: 64 * 1024 * 1024 });
+  return scanDiff(stdout);
 }
 
 /** Custom tools exposed to the agent as `mcp__blackbox__<name>`. Credentials stay in this process. */
@@ -46,7 +58,7 @@ export function blackboxTools(ctx: ToolContext) {
     version: '1.0.0',
     alwaysLoad: true,
     instructions:
-      'Platform tools: progress reporting to the user, Azure DevOps pull requests/CI, and Kubernetes test environments. ' +
+      'Platform tools: progress reporting to the user, pull requests/CI on the git provider, and Kubernetes test environments. ' +
       'Git operations (clone/commit/push) are done with the git CLI in the workspace.',
     tools: [
       tool(
@@ -60,7 +72,7 @@ export function blackboxTools(ctx: ToolContext) {
           totalSteps: z.number().int().optional(),
         },
         async (a) => {
-          run('UPDATE applications SET phase = ?, updated_at = datetime(\'now\') WHERE id = ?', a.phase, app.id);
+          await run("UPDATE applications SET phase = ?, updated_at = datetime('now') WHERE id = ?", a.phase, app.id);
           publish(app.id, runId, 'progress', a);
           publish(app.id, runId, 'app.updated', { phase: a.phase });
           return ok('Progress shown to the user.');
@@ -73,24 +85,26 @@ export function blackboxTools(ctx: ToolContext) {
         {
           summary: z.string().describe('2-4 sentences in plain language: what will be built and how the user will be able to try it'),
           steps: z
-            .array(z.object({ title: z.string().describe('Plain-language step, e.g. "Let members sign in"'), detail: z.string().optional().describe('Optional technical note') }))
+            .array(
+              z.object({
+                title: z.string().describe('Plain-language step, e.g. "Let members sign in"'),
+                detail: z.string().optional().describe('Optional technical note'),
+              }),
+            )
             .min(1),
           stack: z.string().optional().describe('One line: chosen technologies'),
           questions: z.array(z.string()).optional().describe('Open questions for the user, if any'),
         },
         async (a) => {
-          const lines = [
-            '### Here is the plan',
-            a.summary,
-            '',
-            ...a.steps.map((st, i) => `${i + 1}. **${st.title}**${st.detail ? ` — ${st.detail}` : ''}`),
-          ];
+          const lines = ['### Here is the plan', a.summary, '', ...a.steps.map((st, i) => `${i + 1}. **${st.title}**${st.detail ? ` — ${st.detail}` : ''}`)];
           if (a.stack) lines.push('', `_Technology: ${a.stack}_`);
           if (a.questions?.length) lines.push('', '**A few questions for you**', ...a.questions.map((q) => `- ${q}`));
-          addMessage(app.id, 'assistant', lines.join('\n'), runId);
+          // Re-read the setting: the user may have toggled it since the run started.
+          const approval = needsPlanApproval((await one<AppRow>('SELECT require_plan_approval FROM applications WHERE id = ?', app.id)) ?? app);
+          await addMessage(app.id, 'assistant', lines.join('\n'), runId, { type: 'plan', needsApproval: approval });
           publish(app.id, runId, 'activity', { kind: 'plan-shared', title: 'Plan shared in the chat', steps: a.steps.map((st) => st.title) });
           return ok(
-            config.AGENT_REQUIRE_PLAN_APPROVAL
+            approval
               ? 'Plan shown to the user. This platform requires approval: end your turn now with a one-line question asking the user to confirm or adjust the plan.'
               : 'Plan shown to the user. Proceed with the implementation; the user can redirect you at any time.',
           );
@@ -98,8 +112,23 @@ export function blackboxTools(ctx: ToolContext) {
       ),
 
       tool(
+        'list_app_config',
+        'List the configuration variables and secrets people set for this application in Blackbox (names only, never values). ' +
+          'They are injected as environment variables into every preview: read them from the environment in the code (process.env.X, os.environ["X"]…), never hard-code values, and document them in the README.',
+        {},
+        async () => {
+          const rows = await configNames(app.id);
+          return ok(
+            rows.length
+              ? rows.map((r) => `- ${r.key}${r.secret ? ' (secret)' : ''}${r.env === '*' ? '' : ` — only in environment "${r.env}"`}`).join('\n')
+              : 'No configuration set yet. If the app needs an API key or other secret, ask the user to add it in the application settings (Settings → Configuration & secrets).',
+          );
+        },
+      ),
+
+      tool(
         'notify_user',
-        'Send a notification (toast, browser notification, and chat webhook if configured). Use for things that need the user\'s attention: an environment is ready, a PR needs review, you are blocked.',
+        "Send a notification (toast, browser notification, and chat webhook if configured). Use for things that need the user's attention: an environment is ready, a PR needs review, you are blocked.",
         {
           level: z.enum(['info', 'success', 'warning', 'error']),
           title: z.string(),
@@ -114,7 +143,7 @@ export function blackboxTools(ctx: ToolContext) {
 
       tool(
         'create_pull_request',
-        'Open a pull request in Azure DevOps from a pushed feature branch to main. main is protected by branch policies, so this is the only way your work reaches main. A human must approve and complete it.',
+        'Open a pull request from a pushed feature branch to main. main is protected by branch policies, so this is the only way your work reaches main. A human must approve and complete it.',
         {
           sourceBranch: z.string().describe('Pushed branch name, e.g. feature/login'),
           title: z.string(),
@@ -122,13 +151,51 @@ export function blackboxTools(ctx: ToolContext) {
         },
         async (a) => {
           try {
-            const pr = await gitProvider().createPullRequest(repoOf(app), a);
-            run(
-              `INSERT OR REPLACE INTO pull_requests (id, app_id, title, source_branch, status, web_url) VALUES (?, ?, ?, ?, ?, ?)`,
-              pr.id, app.id, pr.title, pr.sourceBranch, pr.status, pr.webUrl,
+            const findings = await scanBranch(ctx.workspace, a.sourceBranch);
+            if (findings.length) {
+              const list = findings.map((f) => `- ${f.file}:${f.line} [${f.rule}] ${f.preview}`).join('\n');
+              publish(app.id, runId, 'activity', {
+                kind: 'error',
+                title: `Pull request blocked: ${findings.length} possible secret(s) in the changes`,
+                detail: list,
+              });
+              return fail(
+                `Pull request blocked: the changes contain what looks like secrets.\n${list}\n` +
+                  'Move them to environment variables. Because force pushes are not allowed, create a fresh branch from origin/main with the cleaned-up changes, ' +
+                  'push it and open the pull request from that branch. Tell the user which credential must be rotated. ' +
+                  'If a finding is a false positive (test fixture, placeholder), rewrite the value so it is obviously fake (e.g. "changeme").',
+              );
+            }
+            // The requester (owner) and the app's editors review it, so the provider notifies them.
+            const reviewerEmails = (
+              await all<{ email: string }>(
+                `SELECT u.email FROM users u WHERE u.id = ?
+                 UNION SELECT u.email FROM app_members m JOIN users u ON m.subject = 'user:' || u.id WHERE m.app_id = ? AND m.role = 'editor'`,
+                app.owner_id,
+                app.id,
+              )
+            ).map((r) => r.email);
+            const pr = await gitProvider().createPullRequest(repoOf(app), { ...a, reviewerEmails });
+            await run(
+              // feedback_seen starts empty: the review loop reacts to every reviewer comment from now on
+              `INSERT INTO pull_requests (id, app_id, title, source_branch, status, web_url, feedback_seen) VALUES (?, ?, ?, ?, ?, ?, '{"comments":[],"failing":[]}')
+               ON CONFLICT (app_id, id) DO UPDATE SET title = excluded.title, source_branch = excluded.source_branch, status = excluded.status, web_url = excluded.web_url`,
+              pr.id,
+              app.id,
+              pr.title,
+              pr.sourceBranch,
+              pr.status,
+              pr.webUrl,
             );
             publish(app.id, runId, 'pr.updated', { ...pr });
             notify(app.id, runId, { level: 'info', title: `Pull request #${pr.id} opened`, message: pr.title, link: pr.webUrl });
+            await audit({
+              action: 'pr.opened',
+              via: 'agent',
+              appId: app.id,
+              target: String(pr.id),
+              detail: { runId, branch: pr.sourceBranch, url: pr.webUrl },
+            });
             return ok({ id: pr.id, url: pr.webUrl, status: pr.status });
           } catch (err) {
             return fail(err);
@@ -143,7 +210,7 @@ export function blackboxTools(ctx: ToolContext) {
         async ({ id }) => {
           try {
             const pr = await gitProvider().getPullRequest(repoOf(app), id);
-            run('UPDATE pull_requests SET status = ? WHERE app_id = ? AND id = ?', pr.status, app.id, id);
+            await run('UPDATE pull_requests SET status = ? WHERE app_id = ? AND id = ?', pr.status, app.id, id);
             publish(app.id, runId, 'pr.updated', { ...pr }, { persist: false });
             return ok(pr);
           } catch (err) {
@@ -158,7 +225,7 @@ export function blackboxTools(ctx: ToolContext) {
         { id: z.number().int(), content: z.string() },
         async ({ id, content }) => {
           try {
-            await gitProvider().commentOnPullRequest(repoOf(app), id, content);
+            await gitProvider().commentOnPullRequest(repoOf(app), id, AGENT_COMMENT_MARK + content);
             return ok('Comment posted.');
           } catch (err) {
             return fail(err);
@@ -168,12 +235,13 @@ export function blackboxTools(ctx: ToolContext) {
 
       tool(
         'enable_ci',
-        'After you have committed an Azure Pipelines YAML file to main via a merged PR (or on your branch), register it as a pipeline and make it a required build-validation policy on main. Call once per repository.',
-        { yamlPath: z.string().default('azure-pipelines.yml') },
+        `After you have committed the CI definition (${gitProvider().ciFile}) to main via a merged PR (or on your branch), make it a required check on main. Call once per repository.`,
+        { yamlPath: z.string().default(gitProvider().ciFile) },
         async ({ yamlPath }) => {
           try {
             const msg = await gitProvider().enableBuildValidation(repoOf(app), yamlPath);
             publish(app.id, runId, 'activity', { kind: 'ci', title: 'CI enabled', detail: msg });
+            await audit({ action: 'ci.enabled', via: 'agent', appId: app.id, target: yamlPath, detail: { runId } });
             return ok(msg);
           } catch (err) {
             return fail(err);
@@ -188,7 +256,10 @@ export function blackboxTools(ctx: ToolContext) {
           `The container must listen on 0.0.0.0:<port> and answer HTTP 200 on healthPath. Environments expire after ${config.K8S_ENV_TTL_HOURS}h. ` +
           `Addons give you ephemeral in-namespace services and inject env vars: postgres → DATABASE_URL (+PG*), redis → REDIS_URL. The user is notified automatically when it is ready.`,
         {
-          envSlug: z.string().regex(/^[a-z0-9-]{1,20}$/).describe('Short id, e.g. "main", "pr-12", "feat-auth". Reusing a slug redeploys that environment.'),
+          envSlug: z
+            .string()
+            .regex(/^[a-z0-9-]{1,20}$/)
+            .describe('Short id, e.g. "main", "pr-12", "feat-auth". Reusing a slug redeploys that environment.'),
           branch: z.string().describe('Branch that has been pushed to origin'),
           port: z.number().int().default(8080),
           healthPath: z.string().default('/'),
@@ -198,73 +269,53 @@ export function blackboxTools(ctx: ToolContext) {
           addons: z.array(z.enum(['postgres', 'redis'])).default([]),
         },
         async (a) => {
-          let envRow: EnvRow | undefined;
           try {
-            const k = kube();
-            const repo = repoOf(app);
-            // Make sure we build exactly what is on the remote.
-            await git(ctx.workspace, 'fetch', 'origin', a.branch);
-            const remoteSha = await git(ctx.workspace, 'rev-parse', `origin/${a.branch}`);
-            const localSha = await git(ctx.workspace, 'rev-parse', 'HEAD').catch(() => '');
-            const warn = localSha && localSha !== remoteSha ? `\nWARNING: local HEAD (${localSha.slice(0, 8)}) differs from origin/${a.branch}; deploying the remote commit. Push first if that is not intended.` : '';
-
-            const names = k.names(app.slug, a.envSlug);
-            envRow = upsertEnv({ app_id: app.id, name: names.name, namespace: names.namespace, branch: a.branch, commit_sha: remoteSha, status: 'building', message: 'Queued', url: names.url });
-            publish(app.id, runId, 'env.updated', { env: envRow });
-
-            const res = await k.deploy({
-              appId: app.id,
-              appSlug: app.slug,
-              repo,
-              workspace: ctx.workspace,
-              envSlug: a.envSlug,
-              branch: a.branch,
-              commitSha: remoteSha,
+            const spec = {
               port: a.port,
               healthPath: a.healthPath,
               dockerfile: a.dockerfile,
               contextSubPath: a.contextSubPath,
               env: a.env,
               addons: a.addons as Addon[],
-              onStatus: (s) => {
-                envRow = upsertEnv({ ...envRow!, status: s.stage === 'ready' ? 'ready' : s.stage, message: s.message });
-                publish(app.id, runId, 'env.updated', { env: envRow });
-                publish(app.id, runId, 'activity', { kind: 'deploy', title: s.message });
-              },
+            };
+            const { res, injected, warning } = await deployEnvironment({
+              app,
+              runId,
+              workspace: ctx.workspace,
+              envSlug: a.envSlug,
+              branch: a.branch,
+              spec,
+              via: 'agent',
             });
-            envRow = upsertEnv({ ...envRow!, status: 'ready', url: res.url, image: res.image, expires_at: res.expiresAt, message: 'Ready' });
-            publish(app.id, runId, 'env.updated', { env: envRow });
-            notify(app.id, runId, {
-              level: 'success',
-              title: `Test environment "${a.envSlug}" is ready`,
-              message: `${a.branch} @ ${remoteSha.slice(0, 8)} is deployed.`,
-              link: res.url,
-            });
-            return ok(`Environment ready.\nURL: ${res.url}\nNamespace: ${res.namespace}\nImage: ${res.image}\nExpires: ${res.expiresAt}${warn}\nVerify it responds (e.g. curl -sf ${res.url}${a.healthPath}) before telling the user it works.`);
+            return ok(
+              [
+                'Environment ready.',
+                `URL: ${res.url}`,
+                injected.length ? `User-configured variables injected (values hidden): ${injected.join(', ')}` : '',
+                `Namespace: ${res.namespace}`,
+                `Image: ${res.image}`,
+                `Expires: ${res.expiresAt}`,
+                warning ? `WARNING: ${warning}` : '',
+                `Verify it responds (e.g. curl -sf ${res.url}${a.healthPath}) before telling the user it works.`,
+              ]
+                .filter(Boolean)
+                .join('\n'),
+            );
           } catch (err) {
-            if (envRow) {
-              envRow = upsertEnv({ ...envRow, status: 'failed', message: (err as Error).message.slice(0, 1000) });
-              publish(app.id, runId, 'env.updated', { env: envRow });
-            }
             return fail(err);
           }
         },
       ),
 
-      tool(
-        'environment_status',
-        'Get pod status and recent warning events of a test environment.',
-        { envSlug: z.string() },
-        async ({ envSlug }) => {
-          try {
-            const k = kube();
-            const { namespace, url } = k.names(app.slug, envSlug);
-            return ok({ url, ...(await k.status(namespace)) });
-          } catch (err) {
-            return fail(err);
-          }
-        },
-      ),
+      tool('environment_status', 'Get pod status and recent warning events of a test environment.', { envSlug: z.string() }, async ({ envSlug }) => {
+        try {
+          const k = kube();
+          const { namespace, url } = k.names(app.slug, envSlug);
+          return ok({ url, ...(await k.status(namespace)) });
+        } catch (err) {
+          return fail(err);
+        }
+      }),
 
       tool(
         'environment_logs',
@@ -281,24 +332,35 @@ export function blackboxTools(ctx: ToolContext) {
         },
       ),
 
-      tool(
-        'delete_environment',
-        'Tear down a test environment you no longer need.',
-        { envSlug: z.string() },
-        async ({ envSlug }) => {
-          try {
-            const k = kube();
-            const { namespace, name } = k.names(app.slug, envSlug);
-            await k.destroy(namespace);
-            const row = one<EnvRow>('SELECT * FROM environments WHERE name = ?', name);
-            if (row) publish(app.id, runId, 'env.updated', { env: upsertEnv({ ...row, status: 'deleted', message: 'Deleted by agent' }) });
-            return ok(`Environment ${name} deleted.`);
-          } catch (err) {
-            return fail(err);
-          }
-        },
-      ),
+      tool('delete_environment', 'Tear down a test environment you no longer need.', { envSlug: z.string() }, async ({ envSlug }) => {
+        try {
+          const k = kube();
+          const { namespace, name } = k.names(app.slug, envSlug);
+          await k.destroy(namespace);
+          await audit({ action: 'env.deleted', via: 'agent', appId: app.id, target: name, detail: { runId } });
+          const row = await one<EnvRow>('SELECT * FROM environments WHERE name = ?', name);
+          if (row) publish(app.id, runId, 'env.updated', { env: await upsertEnv({ ...row, status: 'deleted', message: 'Deleted by agent' }) });
+          return ok(`Environment ${name} deleted.`);
+        } catch (err) {
+          return fail(err);
+        }
+      }),
       ...(portAgentToolsEnabled() ? portAgentTools() : []),
-    ].filter((t) => config.K8S_ENABLED || !K8S_TOOLS.has(t.name)),
+    ]
+      .filter((t) => config.K8S_ENABLED || !K8S_TOOLS.has(t.name))
+      .map((t) => ({
+        ...t,
+        handler: (args: Parameters<typeof t.handler>[0], extra: unknown) =>
+          withSpan(
+            `tool ${t.name}`,
+            { 'blackbox.tool': t.name, 'blackbox.app_id': app.id, 'blackbox.run_id': runId },
+            async (span) => {
+              const res = await t.handler(args as never, extra);
+              if ((res as ToolResult).isError) span.setStatus({ code: SpanStatusCode.ERROR, message: 'tool returned an error' });
+              return res;
+            },
+            ctx.span,
+          ),
+      })),
   });
 }

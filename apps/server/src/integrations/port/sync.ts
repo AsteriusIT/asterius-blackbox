@@ -30,12 +30,13 @@ export function startPortSync(log: Log) {
   subscribeAll((e) => {
     if (TRIGGERS.has(e.type)) markDirty(e.appId);
   });
-  const reconcile = () => {
-    for (const a of all<{ id: string }>('SELECT id FROM applications')) dirty.add(a.id);
+  const reconcile = async () => {
+    for (const a of await all<{ id: string }>('SELECT id FROM applications')) dirty.add(a.id);
     void flush(log);
   };
-  setTimeout(reconcile, 2000).unref();
-  setInterval(reconcile, RECONCILE_MS).unref();
+  const safeReconcile = () => void reconcile().catch((err) => log.warn({ err: (err as Error).message }, 'Port reconcile failed'));
+  setTimeout(safeReconcile, 2000).unref();
+  setInterval(safeReconcile, RECONCILE_MS).unref();
   log.info(`Port catalog sync enabled (${config.PORT_API_URL})`);
 
   function markDirty(appId: string) {
@@ -66,16 +67,16 @@ async function flush(log: Log): Promise<void> {
   return flushing;
 }
 
-export function collectFacts(app: AppRow): AppFacts {
-  const owner = one<{ email: string }>('SELECT email FROM users WHERE id = ?', app.owner_id);
-  const stats = one<{ cost: number | null; runs: number }>('SELECT sum(cost_usd) AS cost, count(*) AS runs FROM runs WHERE app_id = ?', app.id);
-  const progress = one<{ title: string | null; at: string }>(
+export async function collectFacts(app: AppRow): Promise<AppFacts> {
+  const owner = await one<{ email: string }>('SELECT email FROM users WHERE id = ?', app.owner_id);
+  const stats = await one<{ cost: number | null; runs: number }>('SELECT sum(cost_usd) AS cost, count(*) AS runs FROM runs WHERE app_id = ?', app.id);
+  const progress = await one<{ title: string | null; at: string }>(
     "SELECT json_extract(payload, '$.title') AS title, created_at AS at FROM events WHERE app_id = ? AND type = 'progress' ORDER BY seq DESC LIMIT 1",
     app.id,
   );
-  const last = one<{ at: string | null }>('SELECT max(created_at) AS at FROM events WHERE app_id = ?', app.id);
-  const prs = one<{ n: number }>("SELECT count(*) AS n FROM pull_requests WHERE app_id = ? AND status = 'active'", app.id);
-  const live = one<{ url: string | null }>("SELECT url FROM environments WHERE app_id = ? AND status = 'ready' ORDER BY updated_at DESC LIMIT 1", app.id);
+  const last = await one<{ at: string | null }>('SELECT max(created_at) AS at FROM events WHERE app_id = ?', app.id);
+  const prs = await one<{ n: number }>("SELECT count(*) AS n FROM pull_requests WHERE app_id = ? AND status = 'active'", app.id);
+  const live = await one<{ url: string | null }>("SELECT url FROM environments WHERE app_id = ? AND status = 'ready' ORDER BY updated_at DESC LIMIT 1", app.id);
   return {
     app,
     ownerEmail: owner?.email ?? null,
@@ -107,9 +108,9 @@ async function teamFor(email: string | null): Promise<string[] | undefined> {
 }
 
 export async function syncApplication(appId: string) {
-  const app = one<AppRow>('SELECT * FROM applications WHERE id = ?', appId);
+  const app = await one<AppRow>('SELECT * FROM applications WHERE id = ?', appId);
   if (!app) return;
-  const facts = collectFacts(app);
+  const facts = await collectFacts(app);
   const team = await teamFor(facts.ownerEmail);
 
   // 1. Service: shared with humans (criticality, ownership edits…) → merge, and only set the team on creation.
@@ -125,7 +126,7 @@ export async function syncApplication(appId: string) {
   await port.upsertEntity(BP.app, applicationEntity(facts, team), { merge: false, createMissingRelated: true });
 
   // 3. Previews.
-  for (const env of all<EnvRow>('SELECT * FROM environments WHERE app_id = ?', app.id)) {
+  for (const env of await all<EnvRow>('SELECT * FROM environments WHERE app_id = ?', app.id)) {
     if (env.status === 'deleted') {
       if (deletedPreviews.has(env.name)) continue;
       await port.deleteEntity(BP.preview, env.name);
@@ -135,4 +136,11 @@ export async function syncApplication(appId: string) {
       await port.upsertEntity(BP.preview, previewEntity(env, team), { merge: false });
     }
   }
+}
+
+/** Application deletion: remove its Blackbox entities from Port (the `service` is shared with humans and kept). */
+export async function removeFromPort(app: AppRow, envs: EnvRow[]) {
+  if (!port.enabled) return;
+  for (const env of envs) await port.deleteEntity(BP.preview, env.name).catch(() => undefined);
+  await port.deleteEntity(BP.app, app.id).catch(() => undefined);
 }

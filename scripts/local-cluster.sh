@@ -80,8 +80,8 @@ KIND
     [ "$i" = 60 ] && { echo "✗ ingress admission webhook not ready" >&2; exit 1; }
     sleep 2
   done
-  # Same namespaces/RBAC as production, so the setup is identical.
-  kubectl apply -f "$ROOT/deploy/k8s/00-namespaces.yaml" -f "$ROOT/deploy/k8s/10-rbac.yaml" >/dev/null
+  # The dev server uses this kubeconfig directly; it only needs the build namespace (RBAC lives in the Helm chart).
+  kubectl create namespace blackbox-builds --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   echo "✓ local cluster ready (kubeconfig: $KUBECONFIG_FILE — your default kubeconfig is untouched)"
   print_env
 }

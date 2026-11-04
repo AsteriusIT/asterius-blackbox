@@ -1,5 +1,6 @@
+import { t } from '../lib/i18n';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, type Application, type BlackboxEvent, type Environment, type Message, type Platform, type PullRequest } from '../lib/api';
+import { api, toUploads, type Role, type Application, type BlackboxEvent, type Environment, type Message, type Platform, type PullRequest } from '../lib/api';
 import { useBlackboxEvents } from '../lib/stream';
 import { PHASES } from '../lib/labels';
 import { StatusBadge } from './StatusDot';
@@ -8,8 +9,11 @@ import { Timeline } from './Timeline';
 import { Environments } from './Environments';
 import { PullRequests } from './PullRequests';
 import { Icon } from './Icon';
+import { Members } from './Members';
+import { Settings } from './Settings';
+import { History } from './History';
 
-type Tab = 'progress' | 'previews' | 'changes';
+type Tab = 'progress' | 'previews' | 'changes' | 'history' | 'people' | 'settings';
 
 export function AppView({ appId, platform, summary }: { appId: string; platform: Platform | null; summary: Application | null }) {
   const [app, setApp] = useState<Application | null>(summary);
@@ -19,11 +23,13 @@ export function AppView({ appId, platform, summary }: { appId: string; platform:
   const [prs, setPrs] = useState<Record<number, PullRequest>>({});
   const [tab, setTab] = useState<Tab>('progress');
   const [panelOpen, setPanelOpen] = useState(true);
+  const [role, setRole] = useState<Role>('viewer');
   const lastSeq = useRef(0);
 
   const load = useCallback(async () => {
     const [detail, msgs, evts] = await Promise.all([api.app(appId), api.messages(appId), api.events(appId)]);
     setApp(detail.app);
+    setRole(detail.role);
     setEnvs(Object.fromEntries(detail.environments.map((e) => [e.id, e])));
     setPrs(Object.fromEntries(detail.pullRequests.map((p) => [p.id, p])));
     setMessages(msgs);
@@ -73,14 +79,20 @@ export function AppView({ appId, platform, summary }: { appId: string; platform:
     () => void load(),
   );
 
-  const liveEnvs = useMemo(() => Object.values(envs).filter((e) => e.status !== 'deleted').sort((a, b) => b.updated_at.localeCompare(a.updated_at)), [envs]);
+  const liveEnvs = useMemo(
+    () =>
+      Object.values(envs)
+        .filter((e) => e.status !== 'deleted')
+        .sort((a, b) => b.updated_at.localeCompare(a.updated_at)),
+    [envs],
+  );
   const prList = useMemo(() => Object.values(prs).sort((a, b) => b.id - a.id), [prs]);
   const lastProgress = useMemo(() => [...events].reverse().find((e) => e.type === 'progress'), [events]);
   const readyEnv = liveEnvs.find((e) => e.status === 'ready' && e.url);
 
   if (!app) return <div className="empty">Loading…</div>;
-  const running = app.running || app.status === 'running';
-  const status = running ? 'running' : app.status;
+  const running = app.running || app.status === 'running' || app.status === 'queued'; // queued runs can be cancelled too
+  const status = app.status === 'queued' ? 'queued' : running ? 'running' : app.status;
   const phaseIdx = PHASES.findIndex((p) => p.id === app.phase);
 
   return (
@@ -94,15 +106,15 @@ export function AppView({ appId, platform, summary }: { appId: string; platform:
           <div className="topbar-actions">
             {readyEnv && (
               <a className="btn btn-accent btn-sm" href={readyEnv.url!} target="_blank" rel="noreferrer">
-                <Icon name="rocket" size={15} /> Try it
+                <Icon name="rocket" size={15} /> {t('Try it')}
               </a>
             )}
             {app.repo_web_url && (
               <a className="btn btn-ghost btn-sm" href={app.repo_web_url} target="_blank" rel="noreferrer" title="Open the code repository">
-                <Icon name="branch" size={15} /> Code
+                <Icon name="branch" size={15} /> {t('Code')}
               </a>
             )}
-            <button className="icon-btn" onClick={() => setPanelOpen((o) => !o)} title="Toggle details panel">
+            <button className="icon-btn" onClick={() => setPanelOpen((o) => !o)} title={t('Toggle details panel')}>
               <Icon name="panel" />
             </button>
           </div>
@@ -130,7 +142,7 @@ export function AppView({ appId, platform, summary }: { appId: string; platform:
             <span>{app.last_error}</span>
             {!app.repo_web_url && (
               <button className="btn btn-soft btn-sm" onClick={() => api.retryProvisioning(app.id).then(load)}>
-                Try again
+                {t('Try again')}
               </button>
             )}
           </div>
@@ -141,7 +153,8 @@ export function AppView({ appId, platform, summary }: { appId: string; platform:
           running={running}
           messages={messages}
           liveStatus={running ? (lastProgress?.payload.title as string | undefined) : undefined}
-          onSend={(text) => api.send(app.id, text)}
+          readOnly={role === 'viewer' || app.status === 'archived'}
+          onSend={async (text, files) => api.send(app.id, text, await toUploads(files))}
           onStop={() => api.stop(app.id)}
         />
       </div>
@@ -150,19 +163,51 @@ export function AppView({ appId, platform, summary }: { appId: string; platform:
         <aside className="panel">
           <div className="segmented" role="tablist">
             <button role="tab" className={tab === 'progress' ? 'active' : ''} onClick={() => setTab('progress')}>
-              Progress
+              {t('Progress')}
             </button>
             <button role="tab" className={tab === 'previews' ? 'active' : ''} onClick={() => setTab('previews')}>
-              Previews{liveEnvs.length > 0 && <span className="count">{liveEnvs.length}</span>}
+              {t('Previews')}
+              {liveEnvs.length > 0 && <span className="count">{liveEnvs.length}</span>}
             </button>
             <button role="tab" className={tab === 'changes' ? 'active' : ''} onClick={() => setTab('changes')}>
-              Changes{prList.length > 0 && <span className="count">{prList.length}</span>}
+              {t('Changes')}
+              {prList.length > 0 && <span className="count">{prList.length}</span>}
+            </button>
+            <button role="tab" className={tab === 'history' ? 'active' : ''} onClick={() => setTab('history')}>
+              {t('History')}
+            </button>
+            <button role="tab" className={tab === 'people' ? 'active' : ''} onClick={() => setTab('people')}>
+              {t('People')}
+            </button>
+            <button role="tab" className={tab === 'settings' ? 'active' : ''} onClick={() => setTab('settings')}>
+              {t('Settings')}
             </button>
           </div>
           <div className="panel-body">
             {tab === 'progress' && <Timeline events={events} running={running} />}
-            {tab === 'previews' && <Environments envs={liveEnvs} k8sEnabled={platform?.k8sEnabled ?? false} onDelete={(id) => api.deleteEnv(app.id, id)} />}
-            {tab === 'changes' && <PullRequests prs={prList} />}
+            {tab === 'previews' && (
+              <Environments
+                envs={liveEnvs}
+                k8sEnabled={platform?.k8sEnabled ?? false}
+                canEdit={role !== 'viewer'}
+                onDelete={(id) => api.deleteEnv(app.id, id)}
+                onExtend={(id) => api.extendEnv(app.id, id)}
+                onPin={(id, pinned) => api.pinEnv(app.id, id, pinned)}
+                onPromote={(id) => api.promoteEnv(app.id, id)}
+              />
+            )}
+            {tab === 'changes' && <PullRequests appId={app.id} prs={prList} />}
+            {tab === 'history' && <History appId={app.id} />}
+            {tab === 'people' && <Members appId={app.id} canManage={role === 'owner'} />}
+            {tab === 'settings' && (
+              <Settings
+                app={app}
+                platform={platform}
+                canEdit={role !== 'viewer'}
+                isOwner={role === 'owner'}
+                onChange={(a) => setApp((cur) => (cur ? { ...cur, ...a } : a))}
+              />
+            )}
           </div>
         </aside>
       )}

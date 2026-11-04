@@ -1,0 +1,7 @@
+{
+  "name": ".NET API",
+  "description": "ASP.NET Core 9 minimal API.",
+  "stack": ".NET 9",
+  "port": 8080,
+  "healthPath": "/health"
+}

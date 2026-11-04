@@ -1,0 +1,90 @@
+{{- $v := .Values -}}
+{{- if not $v.persistence.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "blackbox.claimName" . }}
+  labels: {{- include "blackbox.labels" . | nindent 4 }}
+spec:
+  accessModes: [{{ $v.persistence.accessMode }}]
+  {{- with $v.persistence.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests: { storage: {{ $v.persistence.size }} }
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  labels: {{- include "blackbox.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $v.api.replicas }}
+  {{- if and (not $v.workers.enabled) (le (int $v.api.replicas) 1) }}
+  strategy: { type: Recreate } # single writer: SQLite + agent sessions in this pod
+  {{- end }}
+  selector:
+    matchLabels: { app: {{ .Release.Name }}, component: api }
+  template:
+    metadata:
+      labels: { app: {{ .Release.Name }}, component: api }
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/config.yaml") . | sha256sum }}
+    spec:
+      {{- include "blackbox.podSpec" (dict "root" . "role" (ternary "api" "all" $v.workers.enabled) "resources" $v.api.resources) | nindent 6 }}
+{{- if $v.workers.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-worker
+  labels: {{- include "blackbox.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $v.workers.replicas }}
+  selector:
+    matchLabels: { app: {{ .Release.Name }}, component: worker }
+  template:
+    metadata:
+      labels: { app: {{ .Release.Name }}, component: worker }
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/config.yaml") . | sha256sum }}
+    spec:
+      terminationGracePeriodSeconds: 60
+      {{- include "blackbox.podSpec" (dict "root" . "role" "worker" "resources" $v.workers.resources) | nindent 6 }}
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+  labels: {{- include "blackbox.labels" . | nindent 4 }}
+spec:
+  selector: { app: {{ .Release.Name }}, component: api }
+  ports: [{ port: 80, targetPort: http, name: http }]
+{{- if $v.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}
+  labels: {{- include "blackbox.labels" . | nindent 4 }}
+  annotations:
+    {{- with $v.ingress.clusterIssuer }}
+    cert-manager.io/cluster-issuer: {{ . }}
+    {{- end }}
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600" # SSE
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: {{ $v.ingress.className }}
+  {{- with $v.ingress.tlsSecret }}
+  tls: [{ hosts: [{{ $v.ingress.host }}], secretName: {{ . }} }]
+  {{- end }}
+  rules:
+    - host: {{ $v.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: {{ $.Release.Name }}, port: { number: 80 } } }
+{{- end }}

@@ -1,0 +1,9 @@
+trigger: [main]
+pool: { vmImage: ubuntu-latest }
+steps:
+  - task: NodeTool@0
+    inputs: { versionSpec: '24.x' }
+  - script: npm install && npm test && npm run build
+    displayName: Tests and build
+  - script: docker build -t app .
+    displayName: Docker build

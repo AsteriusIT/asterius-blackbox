@@ -1,0 +1,12 @@
+dist
+node_modules
+data
+package-lock.json
+.beads
+*.md
+deploy
+.agents
+.codex
+.claude
+docs
+templates

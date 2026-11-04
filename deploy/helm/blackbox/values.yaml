@@ -1,0 +1,96 @@
+image:
+  repository: ghcr.io/asteriusit/asterius-blackbox
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Single pod (default): API + agent sessions in one process, SQLite on the volume.
+# Scaled: set database.url (Postgres) and workers.enabled=true; the volume must then be ReadWriteMany
+# (agent sessions and workspaces are shared by the API and worker pods).
+api:
+  replicas: 1
+  resources:
+    requests: { cpu: "1", memory: 2Gi }
+    limits: { cpu: "4", memory: 8Gi }
+
+workers:
+  enabled: false
+  replicas: 2
+  concurrency: 2 # agent sessions per worker pod
+  resources:
+    requests: { cpu: "1", memory: 2Gi }
+    limits: { cpu: "4", memory: 8Gi }
+
+persistence:
+  size: 50Gi
+  storageClass: ""
+  accessMode: ReadWriteOnce # ReadWriteMany when workers.enabled
+  existingClaim: ""
+
+database:
+  url: "" # postgres://user:pass@host:5432/blackbox (required when workers.enabled or api.replicas > 1)
+
+publicUrl: https://blackbox.example.com
+
+ingress:
+  enabled: true
+  className: nginx
+  host: blackbox.example.com
+  clusterIssuer: letsencrypt
+  tlsSecret: blackbox-tls
+
+agent:
+  plannerModel: claude-opus-5-5
+  coderModel: claude-sonnet-5-5
+  maxBudgetUsd: 25
+  maxConcurrentRuns: 4
+  maxRunsPerUser: 2
+  resumeInterrupted: true
+  sandbox: true
+
+auth:
+  providers: entra # local | entra | local,entra
+  allowRegistration: false
+  entra:
+    tenantId: ""
+    clientId: ""
+
+azureDevOps:
+  enabled: true
+  orgUrl: https://dev.azure.com/my-org
+  project: Blackbox
+  minReviewers: 1
+  requiredReviewerId: ""
+  buildValidation: true
+
+# Alternative git provider (set azureDevOps.enabled=false). Tokens go in the secret: GITHUB_ADMIN_TOKEN, GITHUB_AGENT_TOKEN.
+github:
+  enabled: false
+  owner: my-org
+  minReviewers: 1
+
+kubernetes:
+  enabled: true
+  imageRegistry: myregistry.azurecr.io/blackbox
+  baseDomain: preview.example.com
+  clusterIssuer: letsencrypt
+  ingressClass: nginx
+  ingressNamespace: ingress-nginx
+  envTtlHours: 72
+  previewEgress: all # all | none | dns-only | allowlist
+  previewEgressAllowlist: ""
+  buildNamespace: blackbox-builds
+  admissionPolicy: true # needs Kubernetes >= 1.30
+
+port:
+  enabled: false
+  apiUrl: https://api.port.io
+  defaultTeam: ""
+  actionsEnabled: false
+
+# Extra non-secret settings (any variable of .env.example).
+extraEnv: {}
+
+# Secrets: ANTHROPIC_API_KEY, ADO_ADMIN_PAT, ADO_AGENT_GIT_PAT, ENTRA_CLIENT_SECRET, PORT_CLIENT_ID,
+# PORT_CLIENT_SECRET, NOTIFY_WEBHOOK_URL, DATABASE_URL… Either reference an existing Secret, or let the chart create one.
+existingSecret: ""
+secrets: {}

@@ -1,0 +1,2 @@
+Blackbox {{ .Chart.AppVersion }} — {{ if .Values.workers.enabled }}API x{{ .Values.api.replicas }} + workers x{{ .Values.workers.replicas }} (Postgres){{ else }}single pod (API + agents){{ end }}.
+Open {{ .Values.publicUrl }}

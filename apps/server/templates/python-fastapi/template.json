@@ -1,0 +1,7 @@
+{
+  "name": "Python FastAPI",
+  "description": "FastAPI service on Python 3.13 with pytest.",
+  "stack": "Python 3.13 + FastAPI",
+  "port": 8080,
+  "healthPath": "/health"
+}

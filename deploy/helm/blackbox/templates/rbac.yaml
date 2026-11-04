@@ -1,0 +1,111 @@
+{{- $v := .Values -}}
+# The platform (not the agent) talks to the cluster. The agent has no kubeconfig and can only use the
+# platform's tools, which act exclusively on namespaces labelled app.kubernetes.io/managed-by=asterius-blackbox.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: blackbox
+  labels: {{- include "blackbox.labels" . | nindent 4 }}
+{{- if $v.kubernetes.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-environments
+  labels: {{- include "blackbox.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, create, patch, delete]
+  - apiGroups: [""]
+    resources: [secrets, services, resourcequotas, limitranges]
+    verbs: [get, list, create, patch, delete]
+  - apiGroups: [""]
+    resources: [pods, pods/log, events]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, create, patch, delete]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses, networkpolicies]
+    verbs: [get, list, create, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-environments
+  labels: {{- include "blackbox.labels" . | nindent 4 }}
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: {{ .Release.Name }}-environments }
+subjects: [{ kind: ServiceAccount, name: blackbox, namespace: {{ .Release.Namespace }} }]
+---
+# Kaniko build jobs run here, with the registry push secret.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $v.kubernetes.buildNamespace }}
+  labels: {{- include "blackbox.labels" . | nindent 4 }}
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: builds
+  namespace: {{ $v.kubernetes.buildNamespace }}
+spec:
+  hard: { pods: "6", limits.cpu: "12", limits.memory: 24Gi }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: blackbox-builds
+  namespace: {{ $v.kubernetes.buildNamespace }}
+rules:
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, create, delete]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create, patch, delete]
+  - apiGroups: [""]
+    resources: [pods, pods/log]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: blackbox-builds
+  namespace: {{ $v.kubernetes.buildNamespace }}
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: blackbox-builds }
+subjects: [{ kind: ServiceAccount, name: blackbox, namespace: {{ .Release.Namespace }} }]
+{{- if $v.kubernetes.admissionPolicy }}
+---
+# Whatever the ClusterRole allows, the service account may only write in managed namespaces (+ builds).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ .Release.Name }}-managed-namespaces-only
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - { apiGroups: ["*"], apiVersions: ["*"], operations: [CREATE, UPDATE, DELETE], resources: ["*"] }
+  matchConditions:
+    - name: is-blackbox
+      expression: request.userInfo.username == 'system:serviceaccount:{{ .Release.Namespace }}:blackbox'
+  variables:
+    - name: ns
+      expression: "request.resource.resource == 'namespaces' ? (request.operation == 'DELETE' ? oldObject : object) : namespaceObject"
+    - name: managed
+      expression: "variables.ns != null && has(variables.ns.metadata.labels) && variables.ns.metadata.labels[?'app.kubernetes.io/managed-by'].orValue('') == 'asterius-blackbox'"
+  validations:
+    - expression: "variables.managed || (request.resource.resource != 'namespaces' && request.namespace == '{{ $v.kubernetes.buildNamespace }}')"
+      messageExpression: "'blackbox may only write in namespaces labelled app.kubernetes.io/managed-by=asterius-blackbox (got ' + request.resource.resource + ' in ' + (request.namespace == '' ? request.name : request.namespace) + ')'"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ .Release.Name }}-managed-namespaces-only
+spec:
+  policyName: {{ .Release.Name }}-managed-namespaces-only
+  validationActions: [Deny]
+{{- end }}
+{{- end }}

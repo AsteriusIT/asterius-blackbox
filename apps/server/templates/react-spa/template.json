@@ -1,0 +1,7 @@
+{
+  "name": "React web app",
+  "description": "React 19 single-page app built with Vite, served by nginx.",
+  "stack": "React 19 + Vite",
+  "port": 8080,
+  "healthPath": "/health"
+}

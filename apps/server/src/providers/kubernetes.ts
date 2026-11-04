@@ -4,9 +4,10 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { config } from '../config.js';
+import { config, type Config } from '../config.js';
 import type { RepoInfo } from './git.js';
 import { gitProvider } from './git.js';
+import { withSpan } from '../tracing.js';
 
 const MANAGED_BY = 'asterius-blackbox';
 const FIELD_MANAGER = 'asterius-blackbox';
@@ -28,7 +29,9 @@ export interface DeployRequest {
   contextSubPath?: string;
   env: Record<string, string>;
   addons: Addon[];
-  onStatus: (s: { stage: 'building' | 'deploying' | 'ready' | 'failed'; message: string }) => void;
+  /** Override the TTL: an ISO date, or 'never' for pinned (long-lived) environments. */
+  expiresAt?: string;
+  onStatus: (s: { stage: 'building' | 'deploying' | 'ready' | 'failed'; message: string }) => void | Promise<void>;
 }
 
 export interface DeployResult {
@@ -48,6 +51,31 @@ const dns = (s: string, max = 63) =>
     .slice(0, max)
     .replace(/-$/, '');
 
+/** Egress NetworkPolicy for a preview namespace, or null when egress is unrestricted (K8S_PREVIEW_EGRESS=all). */
+export function egressPolicy(
+  namespace: string,
+  mode: Config['K8S_PREVIEW_EGRESS'] = config.K8S_PREVIEW_EGRESS,
+  allowlist: string[] = config.K8S_PREVIEW_EGRESS_ALLOWLIST,
+): k8s.V1NetworkPolicy | null {
+  if (mode === 'all') return null;
+  const egress: k8s.V1NetworkPolicyEgressRule[] = [{ to: [{ podSelector: {} }] }]; // addons in the same namespace
+  if (mode !== 'none')
+    egress.push({
+      to: [{ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'kube-system' } } }],
+      ports: [
+        { protocol: 'UDP', port: 53 },
+        { protocol: 'TCP', port: 53 },
+      ],
+    });
+  if (mode === 'allowlist' && allowlist.length) egress.push({ to: allowlist.map((cidr) => ({ ipBlock: { cidr } })) });
+  return {
+    apiVersion: 'networking.k8s.io/v1',
+    kind: 'NetworkPolicy',
+    metadata: { name: 'blackbox-egress', namespace },
+    spec: { podSelector: {}, policyTypes: ['Egress'], egress },
+  };
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function isNotFound(err: unknown) {
@@ -60,6 +88,7 @@ export class KubernetesEnvironments {
   private batch: k8s.BatchV1Api;
   private apps: k8s.AppsV1Api;
   private objects: k8s.KubernetesObjectApi;
+  private net: k8s.NetworkingV1Api;
 
   constructor() {
     if (config.KUBECONFIG_PATH) this.kc.loadFromFile(config.KUBECONFIG_PATH);
@@ -69,6 +98,7 @@ export class KubernetesEnvironments {
     this.batch = this.kc.makeApiClient(k8s.BatchV1Api);
     this.apps = this.kc.makeApiClient(k8s.AppsV1Api);
     this.objects = k8s.KubernetesObjectApi.makeApiClient(this.kc);
+    this.net = this.kc.makeApiClient(k8s.NetworkingV1Api);
   }
 
   names(appSlug: string, envSlug: string) {
@@ -99,18 +129,19 @@ export class KubernetesEnvironments {
   // ---------------------------------------------------------------- deploy
   async deploy(req: DeployRequest): Promise<DeployResult> {
     const { name, namespace, host, url } = this.names(req.appSlug, req.envSlug);
-    const expiresAt = new Date(Date.now() + config.K8S_ENV_TTL_HOURS * 3600_000).toISOString();
+    const expiresAt = req.expiresAt ?? new Date(Date.now() + config.K8S_ENV_TTL_HOURS * 3600_000).toISOString();
     const labels = { 'app.kubernetes.io/managed-by': MANAGED_BY, 'blackbox/app-id': req.appId, 'blackbox/env': name };
 
     // 1. Build the image in-cluster from the pushed branch.
     const tag = `${dns(req.branch, 40)}-${req.commitSha.slice(0, 10)}`;
     const image = `${config.K8S_IMAGE_REGISTRY}/${req.appSlug}:${tag}`;
-    req.onStatus({ stage: 'building', message: `Building image ${image} from ${req.branch}@${req.commitSha.slice(0, 8)}` });
-    if (config.K8S_BUILD_MODE === 'docker') await this.dockerBuild(req, image);
-    else await this.build(req, image, labels);
+    await req.onStatus({ stage: 'building', message: `Building image ${image} from ${req.branch}@${req.commitSha.slice(0, 8)}` });
+    await withSpan('k8s.build', { 'blackbox.image': image, 'blackbox.build_mode': config.K8S_BUILD_MODE }, () =>
+      config.K8S_BUILD_MODE === 'docker' ? this.dockerBuild(req, image) : this.build(req, image, labels),
+    );
 
     // 2. Namespace + guard-rails.
-    req.onStatus({ stage: 'deploying', message: `Deploying to namespace ${namespace}` });
+    await req.onStatus({ stage: 'deploying', message: `Deploying to namespace ${namespace}` });
     await this.ensureNamespace(namespace, labels, expiresAt);
 
     // 3. Addons (ephemeral, in-namespace).
@@ -179,8 +210,8 @@ export class KubernetesEnvironments {
     } as k8s.V1Ingress);
 
     // 5. Wait for rollout.
-    await this.waitForRollout(namespace, 'app', req.commitSha);
-    req.onStatus({ stage: 'ready', message: `Environment ready at ${url}` });
+    await withSpan('k8s.rollout', { 'k8s.namespace': namespace }, () => this.waitForRollout(namespace, 'app', req.commitSha));
+    await req.onStatus({ stage: 'ready', message: `Environment ready at ${url}` });
     return { name, namespace, url, image, expiresAt };
   }
 
@@ -194,7 +225,7 @@ export class KubernetesEnvironments {
       apiVersion: 'v1',
       kind: 'ResourceQuota',
       metadata: { name: 'blackbox-quota', namespace },
-      spec: { hard: { 'requests.cpu': '2', 'requests.memory': '4Gi', 'limits.cpu': '4', 'limits.memory': '8Gi', pods: '10', 'persistentvolumeclaims': '2' } },
+      spec: { hard: { 'requests.cpu': '2', 'requests.memory': '4Gi', 'limits.cpu': '4', 'limits.memory': '8Gi', pods: '10', persistentvolumeclaims: '2' } },
     } as k8s.V1ResourceQuota);
     await this.apply({
       apiVersion: 'v1',
@@ -217,6 +248,12 @@ export class KubernetesEnvironments {
         ],
       },
     } as k8s.V1NetworkPolicy);
+    const egress = egressPolicy(namespace);
+    if (egress) await this.apply(egress);
+    else
+      await this.net.deleteNamespacedNetworkPolicy({ name: 'blackbox-egress', namespace }).catch((err) => {
+        if (!isNotFound(err)) throw err;
+      });
   }
 
   private async deployAddon(namespace: string, addon: Addon, labels: Record<string, string>): Promise<Record<string, string>> {
@@ -392,7 +429,13 @@ export class KubernetesEnvironments {
       const d = await this.apps.readNamespacedDeployment({ name, namespace });
       const want = d.spec?.replicas ?? 1;
       const s = d.status;
-      if (s && (s.observedGeneration ?? 0) >= (d.metadata?.generation ?? 0) && (s.updatedReplicas ?? 0) >= want && (s.availableReplicas ?? 0) >= want && !s.unavailableReplicas) {
+      if (
+        s &&
+        (s.observedGeneration ?? 0) >= (d.metadata?.generation ?? 0) &&
+        (s.updatedReplicas ?? 0) >= want &&
+        (s.availableReplicas ?? 0) >= want &&
+        !s.unavailableReplicas
+      ) {
         return;
       }
       // fail fast on obvious pod errors
@@ -401,7 +444,11 @@ export class KubernetesEnvironments {
         if (p.metadata?.annotations?.['blackbox/commit'] !== commit) continue;
         for (const cs of p.status?.containerStatuses ?? []) {
           const reason = cs.state?.waiting?.reason;
-          if (reason && ['CrashLoopBackOff', 'ErrImagePull', 'ImagePullBackOff', 'CreateContainerConfigError'].includes(reason) && (cs.restartCount ?? 0) >= 2) {
+          if (
+            reason &&
+            ['CrashLoopBackOff', 'ErrImagePull', 'ImagePullBackOff', 'CreateContainerConfigError'].includes(reason) &&
+            (cs.restartCount ?? 0) >= 2
+          ) {
             const logs = await this.podLogs(namespace, 'app.kubernetes.io/name=app', 80, true);
             throw new Error(`Pod ${p.metadata?.name} is ${reason}.\n--- logs (tail) ---\n${logs}`);
           }
@@ -450,6 +497,19 @@ export class KubernetesEnvironments {
         .slice(-10)
         .map((e) => `${e.involvedObject?.kind}/${e.involvedObject?.name}: ${e.reason} ${e.message}`),
     };
+  }
+
+  /** Readiness: the API server answers and our build namespace is readable. */
+  async ping() {
+    await this.core.readNamespace({ name: config.K8S_BUILD_NAMESPACE });
+  }
+
+  /** Change an environment's expiry ('never' = pinned); the reaper only deletes past ISO dates. */
+  async setExpiry(namespace: string, expiresAt: string) {
+    await this.core.patchNamespace(
+      { name: namespace, body: { metadata: { annotations: { 'blackbox/expires-at': expiresAt } } } },
+      k8s.setHeaderOptions('Content-Type', k8s.PatchStrategy.MergePatch),
+    );
   }
 
   async destroy(namespace: string) {

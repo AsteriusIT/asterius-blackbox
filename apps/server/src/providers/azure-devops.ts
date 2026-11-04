@@ -17,6 +17,7 @@ const basic = (pat: string) => 'Basic ' + Buffer.from(`:${pat}`).toString('base6
 
 export class AzureDevOpsProvider implements GitProvider {
   readonly kind = 'azure-devops' as const;
+  readonly ciFile = 'azure-pipelines.yml';
   private org: string;
   private project: string;
   private adminPat: string;
@@ -58,6 +59,34 @@ export class AzureDevOpsProvider implements GitProvider {
     return this.projectId;
   }
 
+  private identities = new Map<string, Promise<string | null>>();
+
+  /** Entra user (email / UPN) → Azure DevOps identity id, via the org's identity service (cached; null if unknown). */
+  identityId(email: string): Promise<string | null> {
+    const key = email.toLowerCase();
+    let id = this.identities.get(key);
+    if (!id) {
+      const vssps = this.org.replace('://dev.azure.com/', '://vssps.dev.azure.com/');
+      id = fetch(`${vssps}/_apis/identities?searchFilter=General&filterValue=${encodeURIComponent(key)}&queryMembership=None&${API}`, {
+        headers: { authorization: basic(this.adminPat), accept: 'application/json' },
+      })
+        .then(async (res) => (res.ok ? (((await res.json()) as { value?: { id: string }[] }).value?.[0]?.id ?? null) : null))
+        .catch(() => null); // unknown identity: the PR is created without that reviewer
+      this.identities.set(key, id);
+    }
+    return id;
+  }
+
+  async deleteRepository(repo: RepoInfo) {
+    // Goes to the project's recycle bin (restorable for 30 days by a project admin).
+    await this.api('DELETE', `git/repositories/${repo.repoId}`);
+  }
+
+  async ping() {
+    this.projectId = undefined; // re-check credentials and project access every time
+    await this.getProjectId();
+  }
+
   describePolicies() {
     const p = [
       `Minimum ${config.ADO_MIN_REVIEWERS} approving reviewer(s) on main; the PR author's vote does not count; votes reset on new pushes`,
@@ -70,7 +99,7 @@ export class AzureDevOpsProvider implements GitProvider {
     return p;
   }
 
-  async createRepository(input: { slug: string; name: string; description: string }): Promise<RepoInfo> {
+  async createRepository(input: { slug: string; name: string; description: string; files?: Record<string, string> }): Promise<RepoInfo> {
     const projectId = await this.getProjectId();
     const repo = await this.api<{ id: string; name: string; remoteUrl: string; webUrl: string }>('POST', 'git/repositories', {
       name: input.slug,
@@ -89,6 +118,11 @@ export class AzureDevOpsProvider implements GitProvider {
               item: { path: '/README.md' },
               newContent: { content: initialReadme(input.name, input.description), contentType: 'rawtext' },
             },
+            ...Object.entries(input.files ?? {}).map(([rel, content]) => ({
+              changeType: 'add',
+              item: { path: `/${rel}` },
+              newContent: { content, contentType: 'rawtext' },
+            })),
           ],
         },
       ],
@@ -96,6 +130,17 @@ export class AzureDevOpsProvider implements GitProvider {
     await this.api('PATCH', `git/repositories/${repo.id}`, { defaultBranch: 'refs/heads/main' });
     await this.applyMainPolicies(repo.id);
 
+    return { repoId: repo.id, name: repo.name, webUrl: repo.webUrl, cloneUrl: repo.remoteUrl };
+  }
+
+  /** `source`: repository name, or its web/clone URL (…/_git/<name>), in ADO_PROJECT. */
+  async importRepository(input: { slug: string; source: string }): Promise<RepoInfo> {
+    const name = decodeURIComponent(input.source.includes('/_git/') ? input.source.split('/_git/')[1]!.split(/[/?#]/)[0]! : input.source.trim());
+    const repo = await this.api<{ id: string; name: string; remoteUrl: string; webUrl: string }>('GET', `git/repositories/${encodeURIComponent(name)}`);
+    const main = await this.api<{ value: unknown[] }>('GET', `git/repositories/${repo.id}/refs?filter=heads/main`);
+    if (!main.value.length) throw new Error(`Repository ${repo.name} has no main branch: Blackbox works on main + pull requests.`);
+    const existing = await this.api<{ count: number }>('GET', `policy/configurations?repositoryId=${repo.id}&refName=refs/heads/main`);
+    if (!existing.count) await this.applyMainPolicies(repo.id); // keep the team's own policies when it has some
     return { repoId: repo.id, name: repo.name, webUrl: repo.webUrl, cloneUrl: repo.remoteUrl };
   }
 
@@ -145,13 +190,15 @@ export class AzureDevOpsProvider implements GitProvider {
     await exec('git', ['-C', dir, 'config', `http.${host}/.extraheader`, `AUTHORIZATION: ${basic(this.agentPat)}`]);
   }
 
-  async createPullRequest(repo: RepoInfo, pr: { sourceBranch: string; targetBranch?: string; title: string; description: string }) {
+  async createPullRequest(repo: RepoInfo, pr: { sourceBranch: string; targetBranch?: string; title: string; description: string; reviewerEmails?: string[] }) {
     const ref = (b: string) => (b.startsWith('refs/') ? b : `refs/heads/${b}`);
+    const reviewers = (await Promise.all((pr.reviewerEmails ?? []).map((e) => this.identityId(e)))).filter((id): id is string => Boolean(id));
     const created = await this.api<{ pullRequestId: number }>('POST', `git/repositories/${repo.repoId}/pullrequests`, {
       sourceRefName: ref(pr.sourceBranch),
       targetRefName: ref(pr.targetBranch ?? 'main'),
       title: pr.title,
       description: pr.description.slice(0, 4000),
+      reviewers: [...new Set(reviewers)].map((id) => ({ id, isRequired: false })),
     });
     return this.getPullRequest(repo, created.pullRequestId);
   }
@@ -169,7 +216,12 @@ export class AzureDevOpsProvider implements GitProvider {
     }>('GET', `git/repositories/${repo.repoId}/pullrequests/${id}`);
 
     const threads = await this.api<{
-      value: { status?: string; isDeleted?: boolean; threadContext?: { filePath?: string }; comments: { author: { displayName: string }; content?: string; commentType: string }[] }[];
+      value: {
+        status?: string;
+        isDeleted?: boolean;
+        threadContext?: { filePath?: string };
+        comments: { author: { displayName: string }; content?: string; commentType: string }[];
+      }[];
     }>('GET', `git/repositories/${repo.repoId}/pullrequests/${id}/threads`);
 
     let policies: PullRequestInfo['policies'] = [];

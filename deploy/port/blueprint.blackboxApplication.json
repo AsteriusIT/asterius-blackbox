@@ -15,16 +15,20 @@
         "enum": [
           "provisioning",
           "ready",
+          "queued",
           "running",
           "idle",
-          "error"
+          "error",
+          "archived"
         ],
         "enumColors": {
           "provisioning": "lightGray",
           "ready": "blue",
+          "queued": "orange",
           "running": "turquoise",
           "idle": "green",
-          "error": "red"
+          "error": "red",
+          "archived": "darkGray"
         }
       },
       "phase": {

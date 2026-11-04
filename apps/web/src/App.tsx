@@ -35,7 +35,10 @@ export function App() {
 
   useEffect(() => {
     consumeAuthCallback();
-    api.platform().then(setPlatform).catch(() => undefined);
+    api
+      .platform()
+      .then(setPlatform)
+      .catch(() => undefined);
     if (!auth.token) {
       setChecked(true);
       return;

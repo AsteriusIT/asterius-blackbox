@@ -1,0 +1,7 @@
+{
+  "name": "Node.js API",
+  "description": "HTTP JSON API on Node.js 24, no framework, node:test tests.",
+  "stack": "Node.js 24",
+  "port": 8080,
+  "healthPath": "/health"
+}

@@ -13,14 +13,38 @@ const schema = z.object({
   PORT: z.coerce.number().default(8080),
   DATA_DIR: z.string().default(path.resolve(process.cwd(), '../../data')),
   PUBLIC_URL: z.string().default('http://localhost:5173'),
+  /** Empty: SQLite under DATA_DIR (single instance). postgres://… for several replicas / worker pods. */
+  DATABASE_URL: z.string().optional(),
+  DATABASE_POOL_SIZE: z.coerce.number().default(10),
+  /** 32-byte key (base64 or hex) encrypting application secrets; generated under DATA_DIR when unset (single instance only). */
+  SECRETS_KEY: z.string().optional(),
+  /** Optional bearer token required on /metrics. */
+  METRICS_TOKEN: z.string().optional(),
   /** Serve the built web UI from the API process (production image). */
   WEB_DIST_DIR: z.string().optional(),
   /** Comma-separated sign-in methods: `local` (email + password) and/or `entra` (Microsoft Entra ID SSO). */
   AUTH_PROVIDERS: z
     .string()
     .default('local')
-    .transform((v) => v.split(',').map((x) => x.trim()).filter(Boolean))
+    .transform((v) =>
+      v
+        .split(',')
+        .map((x) => x.trim())
+        .filter(Boolean),
+    )
     .pipe(z.array(z.enum(['local', 'entra'])).min(1)),
+  /** Poll open pull requests every N seconds and let the agent address new review comments / failing checks (0 = off). */
+  PR_FEEDBACK_POLL_SECONDS: z.coerce.number().int().min(0).default(120),
+  /** Comma-separated emails of platform admins (global audit log, costs and budgets). */
+  ADMIN_EMAILS: z
+    .string()
+    .default('')
+    .transform((v) =>
+      v
+        .split(',')
+        .map((x) => x.trim().toLowerCase())
+        .filter(Boolean),
+    ),
   /** Local accounts only: allow self-registration. */
   ALLOW_REGISTRATION: bool(true),
   ENTRA_TENANT_ID: z.string().optional(),
@@ -40,14 +64,42 @@ const schema = z.object({
   /** When true the planner shares its plan and waits for the user's go before building. */
   AGENT_REQUIRE_PLAN_APPROVAL: bool(false),
   AGENT_MAX_TURNS: z.coerce.number().default(400),
+  /** Monthly budgets (USD, UTC calendar month) that block new runs once reached; 0 = unlimited. Admins can override per user/app. */
+  BUDGET_USER_MONTHLY_USD: z.coerce.number().min(0).default(0),
+  BUDGET_APP_MONTHLY_USD: z.coerce.number().min(0).default(0),
+  BUDGET_GLOBAL_MONTHLY_USD: z.coerce.number().min(0).default(0),
   /** Hard cap in USD for a single run (one user message → agent done). */
   AGENT_MAX_BUDGET_USD: z.coerce.number().default(25),
+  /** Cluster-wide cap on concurrently running agent sessions (each may also run an image build). */
+  AGENT_MAX_CONCURRENT_RUNS: z.coerce.number().int().min(1).default(4),
+  /** Per-user cap on concurrently running agent sessions; further requests wait in the queue. */
+  AGENT_MAX_RUNS_PER_USER: z.coerce.number().int().min(1).default(2),
+  /** After a restart, resume runs that were interrupted (same agent session) instead of stopping them. */
+  AGENT_RESUME_INTERRUPTED: bool(false),
+  /** all: API + agent worker in one process (default) | api: HTTP only | worker: runs agent sessions only. */
+  BLACKBOX_ROLE: z.enum(['all', 'api', 'worker']).default('all'),
+  /** Max agent sessions this worker process runs at once (defaults to AGENT_MAX_CONCURRENT_RUNS). */
+  WORKER_CONCURRENCY: z.coerce.number().int().min(1).optional(),
+  /** Stable worker identity (defaults to the hostname = pod name) used to recover its runs after a restart. */
+  WORKER_ID: z.string().optional(),
+  /** Delete low-level activity events of finished runs after N days (0 = keep forever). Messages and milestones stay. */
+  EVENTS_RETENTION_DAYS: z.coerce.number().int().min(0).default(30),
+  /** Remove workspace clones of applications idle for N days (0 = never); they are re-cloned on demand. */
+  WORKSPACE_GC_DAYS: z.coerce.number().int().min(0).default(14),
   /** Run the agent's shell commands in the Claude Code sandbox (bubblewrap on Linux). */
   AGENT_SANDBOX: bool(true),
 
   // ---- Git provider ----
   /** `azure-devops` for real use, `local` for offline dev (bare repos + a hook that rejects pushes to main). */
-  GIT_PROVIDER: z.enum(['azure-devops', 'local']).default('local'),
+  GIT_PROVIDER: z.enum(['azure-devops', 'github', 'local']).default('local'),
+  /** GitHub: organization or user that owns the repositories. */
+  GITHUB_OWNER: z.string().optional(),
+  /** Platform token: repositories (create/delete), rulesets, pull requests. Never given to the agent. */
+  GITHUB_ADMIN_TOKEN: z.string().optional(),
+  /** Agent token for git push: contents read/write only, not a ruleset bypass actor. */
+  GITHUB_AGENT_TOKEN: z.string().optional(),
+  GITHUB_API_URL: z.string().default('https://api.github.com'),
+  GITHUB_MIN_REVIEWERS: z.coerce.number().int().min(0).default(1),
   ADO_ORG_URL: z.string().optional(), // https://dev.azure.com/my-org
   ADO_PROJECT: z.string().optional(),
   /** PAT used by the platform: repo creation, branch policies, PRs. Never exposed to the agent. */
@@ -96,6 +148,23 @@ const schema = z.object({
   K8S_INGRESS_TLS_SECRET: z.string().optional(),
   K8S_CLUSTER_ISSUER: z.string().optional(),
   K8S_ENV_TTL_HOURS: z.coerce.number().default(72),
+  /** Upper bound when people extend a preview's lifetime (pinning has no limit). */
+  K8S_ENV_MAX_TTL_DAYS: z.coerce.number().default(30),
+  /**
+   * Outbound traffic of preview pods: all (default) | none (same namespace only) | dns-only (+ cluster DNS)
+   * | allowlist (+ DNS + K8S_PREVIEW_EGRESS_ALLOWLIST CIDRs).
+   */
+  K8S_PREVIEW_EGRESS: z.enum(['all', 'none', 'dns-only', 'allowlist']).default('all'),
+  /** Comma-separated CIDRs, e.g. 10.0.0.0/8,52.10.20.30/32 */
+  K8S_PREVIEW_EGRESS_ALLOWLIST: z
+    .string()
+    .default('')
+    .transform((v) =>
+      v
+        .split(',')
+        .map((x) => x.trim())
+        .filter(Boolean),
+    ),
 
   // ---- Port (getport.io) ----
   /** Port API credentials (Port → ... → Credentials). When set, Blackbox syncs its catalog to Port. */

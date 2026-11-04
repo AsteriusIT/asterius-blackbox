@@ -79,15 +79,19 @@ Set `AGENT_REQUIRE_PLAN_APPROVAL=true` to make the planner wait for the user's g
 | `ADO_MIN_REVIEWERS`, `ADO_REQUIRED_REVIEWER_ID` | Review gate on `main`. The PR author's vote never counts. |
 | `ADO_BUILD_VALIDATION` | When the agent adds `azure-pipelines.yml` it calls `enable_ci`, which registers the pipeline and makes it a required check. |
 
+## GitHub
+
+`GIT_PROVIDER=github` creates private repositories under `GITHUB_OWNER` (organization or user). `main` is protected by a repository ruleset: pull request with `GITHUB_MIN_REVIEWERS` approvals (stale approvals dismissed), resolved conversations, squash only, no force-push or deletion. `enable_ci` makes the GitHub Actions job `ci` (`.github/workflows/ci.yml`) a required check. As with Azure DevOps there are two tokens: `GITHUB_ADMIN_TOKEN` for the platform, and `GITHUB_AGENT_TOKEN` (Contents read/write only, never a ruleset bypass actor) for the agent's `git push`. PR reviewers are resolved from people's public GitHub emails (best effort).
+
 ## Kubernetes test environments (production)
 
 Prerequisites: an ingress controller, a wildcard DNS `*.preview.example.com` pointing at it, a registry (ACR attached to AKS works without pull secrets), and optionally cert-manager.
 
+The Helm chart (below) creates the `blackbox-builds` namespace, the RBAC and the admission policy. Then:
+
 ```bash
-kubectl apply -f deploy/k8s/00-namespaces.yaml -f deploy/k8s/10-rbac.yaml
 kubectl -n blackbox-builds create secret docker-registry registry-push \
   --docker-server=myregistry.azurecr.io --docker-username=<sp-id> --docker-password=<sp-secret>
-# then set K8S_ENABLED=true and the K8S_* variables
 ```
 
 For each environment, the platform:
@@ -98,11 +102,28 @@ For each environment, the platform:
 
 ## Deploying Blackbox itself
 
+CI publishes `ghcr.io/asteriusit/asterius-blackbox` on every push to `main`. Deploy with the Helm chart in [deploy/helm/blackbox](deploy/helm/blackbox) (values for ADO, Kubernetes, Port and Entra in `values.yaml`):
+
 ```bash
-docker build -t myregistry.azurecr.io/asterius-blackbox:latest .
+kubectl create namespace blackbox-system
 kubectl -n blackbox-system create secret generic blackbox-secrets \
-  --from-literal=ANTHROPIC_API_KEY=... --from-literal=ADO_ADMIN_PAT=... --from-literal=ADO_AGENT_GIT_PAT=...
-kubectl apply -f deploy/k8s/20-blackbox.yaml   # edit the ConfigMap / hosts first
+  --from-literal=ANTHROPIC_API_KEY=... --from-literal=ADO_ADMIN_PAT=... --from-literal=ADO_AGENT_GIT_PAT=... \
+  --from-literal=ENTRA_CLIENT_SECRET=...
+helm upgrade --install blackbox deploy/helm/blackbox -n blackbox-system \
+  --set existingSecret=blackbox-secrets --set publicUrl=https://blackbox.example.com --set ingress.host=blackbox.example.com \
+  --set auth.entra.tenantId=... --set auth.entra.clientId=...
 ```
+
+- **Single pod** (default): API + agent sessions in one process, SQLite on a ReadWriteOnce volume.
+- **Scaled**: `--set database.url=postgres://… --set workers.enabled=true --set persistence.accessMode=ReadWriteMany`. Then the API (`api.replicas`) and the agent workers (`workers.replicas` × `workers.concurrency` sessions) scale independently, and a compromised agent session cannot reach the API process.
+
+### Backups
+
+```bash
+scripts/backup.sh backup            # → backups/blackbox-<timestamp>.tar.gz (DB snapshot or pg_dump, agent sessions, local repos, attachments, secrets key)
+scripts/backup.sh restore <archive> # stop Blackbox first; the current DATA_DIR is moved aside
+```
+
+The SQLite snapshot is safe while Blackbox runs. With Postgres, `pg_dump`/`pg_restore` must match the server's major version (`PG_DUMP=… PG_RESTORE=…` to override). Workspaces are not backed up: they are re-cloned on demand.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the agent loop, the event model and the security boundaries.

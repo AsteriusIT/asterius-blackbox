@@ -1,136 +1,217 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { query, type HookCallback, type Query, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+import { query, type Query, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { config, paths } from '../config.js';
-import { newId, one, run, updateApp, type AppRow, type MessageRow } from '../db.js';
-import { notify, publish } from '../events.js';
+import { all, newId, one, run, updateApp, withLock, type AppRow, type MessageRow } from '../db.js';
+import { notify, onControl, publish, sendControl, type ControlSignal } from '../events.js';
 import { exec, gitProvider, type RepoInfo } from '../providers/git.js';
 import { coderAgent, kickoffPrompt, PLANNER_TOOLS, systemPromptAppend } from './prompt.js';
 import { addMessage } from './messages.js';
 export { addMessage };
 import { blackboxTools } from './tools.js';
+import { guardHook } from './guard.js';
+import { RunRecorder } from './mapper.js';
+import { PromptStream } from './prompt-stream.js';
+import { metrics } from '../metrics.js';
+import { audit } from '../audit.js';
+import { budgetBlock } from '../costs.js';
+import { getTemplate, templateFiles } from '../templates.js';
+import { attachmentBlocks, promptContent, type StoredAttachment } from './attachments.js';
+import { tracer } from '../tracing.js';
+import { SpanStatusCode, type Span } from '@opentelemetry/api';
+
+/**
+ * Agent runs are a queue in the database (runs.status = queued → running → succeeded | failed | stopped):
+ *  - API side (any process): user messages join the app's queued run, or are delivered as feedback to its
+ *    running one; stop requests cancel the queued run or signal the worker.
+ *  - Worker side (BLACKBOX_ROLE=all|worker): claims queued runs within the concurrency limits and runs the
+ *    Claude Agent SDK session. Signals travel over the control channel (Postgres NOTIFY across pods).
+ * Each user message is tagged with the run that consumes it, so none is lost when a run ends while it arrives.
+ */
 
 const agentHome = path.join(config.DATA_DIR, 'agent-home');
 fs.mkdirSync(agentHome, { recursive: true });
 fs.mkdirSync(paths.workspaces, { recursive: true });
 
-/** A push-based async iterable used as the agent's prompt stream, so the user can send feedback mid-run. */
-class PromptStream implements AsyncIterable<SDKUserMessage> {
-  private queue: SDKUserMessage[] = [];
-  private waiter?: (r: IteratorResult<SDKUserMessage>) => void;
-  private closed = false;
-
-  push(text: string) {
-    const msg: SDKUserMessage = { type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null };
-    if (this.waiter) {
-      const w = this.waiter;
-      this.waiter = undefined;
-      w({ value: msg, done: false });
-    } else this.queue.push(msg);
-  }
-  get pending() {
-    return this.queue.length;
-  }
-  close() {
-    this.closed = true;
-    this.waiter?.({ value: undefined, done: true });
-    this.waiter = undefined;
-  }
-  [Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
-    return {
-      next: () => {
-        const next = this.queue.shift();
-        if (next) return Promise.resolve({ value: next, done: false });
-        if (this.closed) return Promise.resolve({ value: undefined, done: true });
-        return new Promise((resolve) => (this.waiter = resolve));
-      },
-    };
-  }
+export interface RunRow {
+  id: string;
+  app_id: string;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'stopped';
+  prompt: string | null;
+  worker: string | null;
+  heartbeat_at: string | null;
+  cost_usd: number | null;
+  started_at: string;
 }
 
-interface ActiveRun {
-  runId: string;
-  stream: PromptStream;
-  q?: Query;
-  abort: AbortController;
+const iso = () => new Date().toISOString();
+const FEEDBACK_PREFIX = '[New message from the user while you are working — take it into account]\n';
+const RESUME_PROMPT = 'The platform restarted while you were working. Check the state of the workspace and of the plan, then continue where you left off.';
+
+// ------------------------------------------------------------------ API side
+
+/** The app's queued run, created if needed (one per app, enforced by a unique index). */
+async function queuedRun(appId: string, prompt: string | null = null) {
+  const now = iso();
+  await run(
+    "INSERT INTO runs (id, app_id, status, prompt, queued_at, started_at) VALUES (?, ?, 'queued', ?, ?, ?) ON CONFLICT DO NOTHING",
+    newId(),
+    appId,
+    prompt,
+    now,
+    now,
+  );
+  const q = (await one<RunRow>("SELECT * FROM runs WHERE app_id = ? AND status = 'queued'", appId))!;
+  if (prompt && q.prompt !== prompt) await run("UPDATE runs SET prompt = COALESCE(prompt || '\n\n', '') || ? WHERE id = ?", prompt, q.id);
+  return q.id;
 }
 
-const active = new Map<string, ActiveRun>();
-/** Messages received while the repository is still being provisioned. */
-const pendingBeforeReady = new Map<string, string[]>();
+async function showQueued(appId: string) {
+  const app = await one<AppRow>('SELECT status FROM applications WHERE id = ?', appId);
+  if (!app || app.status === 'provisioning' || app.status === 'running') return;
+  await updateApp(appId, { status: 'queued' });
+  void publish(appId, null, 'app.updated', { status: 'queued' });
+}
 
-export const isRunning = (appId: string) => active.has(appId);
-
-// ------------------------------------------------------------------ public API
-
-
-export function queueBeforeReady(appId: string, text: string) {
-  pendingBeforeReady.set(appId, [...(pendingBeforeReady.get(appId) ?? []), text]);
+/** Re-attach a message to the app's queued run, unless another process already did. */
+async function requeueMessage(appId: string, messageId: string, fromRunId: string) {
+  const q = await queuedRun(appId);
+  const moved = await run('UPDATE messages SET run_id = ? WHERE id = ? AND run_id = ?', q, messageId, fromRunId);
+  if (moved.changes) {
+    await showQueued(appId);
+    await sendControl({ type: 'wake' });
+  }
 }
 
 /** Entry point for every user chat message. */
-export function sendUserMessage(app: AppRow, text: string) {
-  const current = active.get(app.id);
-  addMessage(app.id, 'user', text, current?.runId ?? null);
-
-  if (app.status === 'provisioning') {
-    queueBeforeReady(app.id, text);
-    return { queued: true };
+export async function sendUserMessage(
+  app: AppRow,
+  text: string,
+  attachments: StoredAttachment[] = [],
+): Promise<{ queued?: true; delivered?: true; blocked?: string }> {
+  const current = await one<RunRow>(
+    "SELECT * FROM runs WHERE app_id = ? AND status IN ('running', 'queued') ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END LIMIT 1",
+    app.id,
+  );
+  if (app.status === 'archived') return { blocked: 'This application is archived (read-only). Its owner can restore it.' };
+  if (!current) {
+    // A new run would start: respect the monthly budgets (feedback to a running session is always delivered).
+    const blocked = await budgetBlock(app.id);
+    if (blocked) {
+      await addMessage(app.id, 'user', text);
+      await addMessage(app.id, 'system', blocked);
+      return { blocked };
+    }
   }
-  if (current) {
-    // Fold into the running session: the agent sees it at its next step.
-    current.stream.push(`[New message from the user while you are working — take it into account]\n${text}`);
-    publish(app.id, current.runId, 'activity', { kind: 'feedback', title: 'Your message was delivered to the agent' });
+  const runId = current?.id ?? (await queuedRun(app.id));
+  const msg = await addMessage(app.id, 'user', text, runId, attachments.length ? { attachments } : undefined);
+  // Re-read after the message is stored: a worker may have claimed or finished the run meanwhile.
+  const status = (await one<RunRow>('SELECT status FROM runs WHERE id = ?', runId))?.status;
+  if (status === 'running') {
+    await sendControl({ type: 'feedback', runId, messageId: msg.id });
     return { delivered: true };
   }
-  void startRun(app.id, text);
-  return { started: true };
+  if (status === 'queued') {
+    await showQueued(app.id);
+    await sendControl({ type: 'wake' });
+  } else await requeueMessage(app.id, msg.id, runId);
+  return { queued: true };
 }
 
-export async function stopRun(appId: string) {
-  const r = active.get(appId);
-  if (!r) return false;
-  r.stream.close();
-  try {
-    await r.q?.interrupt();
-  } catch {
-    r.abort.abort();
+/**
+ * A run the platform starts on its own (e.g. PR feedback): queued with `prompt` unless the app is archived or over
+ * budget; `note` is shown in the chat. Returns false when it was not queued.
+ */
+export async function queueSystemRun(appId: string, prompt: string, note: string) {
+  const app = await one<AppRow>('SELECT * FROM applications WHERE id = ?', appId);
+  if (!app || app.status === 'archived' || !app.repo_id) return false;
+  const blocked = await budgetBlock(appId);
+  if (blocked) {
+    await addMessage(appId, 'system', `${note.split('.')[0]}. ${blocked}`);
+    return false;
   }
+  await queuedRun(appId, prompt);
+  await addMessage(appId, 'system', note);
+  await showQueued(appId);
+  await sendControl({ type: 'wake' });
   return true;
 }
 
-/** Create the ADO repository + policies, then start the first run with whatever the user already said. */
+/** Cancel the queued run and/or interrupt the running one. */
+export async function stopRun(appId: string) {
+  const cancelled = await run(
+    "UPDATE runs SET status = 'stopped', ended_at = ?, summary = 'Cancelled before it started' WHERE app_id = ? AND status = 'queued'",
+    iso(),
+    appId,
+  );
+  const running = await one<RunRow>("SELECT id FROM runs WHERE app_id = ? AND status = 'running'", appId);
+  if (running) await sendControl({ type: 'stop', runId: running.id });
+  else if (cancelled.changes) {
+    await updateApp(appId, { status: 'idle' });
+    void publish(appId, null, 'app.updated', { status: 'idle' });
+  }
+  return Boolean(cancelled.changes || running);
+}
+
+/** Create the repository + policies; messages sent meanwhile wait in the app's queued run. */
 export async function provisionApp(appId: string) {
-  const app = one<AppRow>('SELECT * FROM applications WHERE id = ?', appId)!;
+  const app = (await one<AppRow>('SELECT * FROM applications WHERE id = ?', appId))!;
   try {
     const where = gitProvider().kind === 'azure-devops' ? `Azure DevOps project ${config.ADO_PROJECT}` : 'the local git server';
-    publish(appId, null, 'progress', { phase: 'understanding', title: `Creating the repository in ${where}`, detail: 'Pushing an initial commit and protecting main with branch policies' });
-    const repo = await gitProvider().createRepository({ slug: app.slug, name: app.name, description: app.description });
-    updateApp(appId, { status: 'ready', repo_id: repo.repoId, repo_name: repo.name, repo_web_url: repo.webUrl, repo_clone_url: repo.cloneUrl });
-    publish(appId, null, 'app.updated', { status: 'ready', repo_web_url: repo.webUrl });
-    publish(appId, null, 'activity', {
+    void publish(appId, null, 'progress', {
+      phase: 'understanding',
+      title: `Creating the repository in ${where}`,
+      detail: 'Pushing an initial commit and protecting main with branch policies',
+    });
+    const ci = gitProvider().ciFile;
+    const files = getTemplate(app.template)
+      ? Object.fromEntries(
+          Object.entries(templateFiles(app.template!, { name: app.name, slug: app.slug })).filter(
+            ([p]) => !['azure-pipelines.yml', '.github/workflows/ci.yml'].includes(p) || p === ci,
+          ),
+        )
+      : undefined;
+    const repo = app.repo_source
+      ? await gitProvider().importRepository({ slug: app.slug, source: app.repo_source })
+      : await gitProvider().createRepository({ slug: app.slug, name: app.name, description: app.description, files });
+    await updateApp(appId, { status: 'ready', repo_id: repo.repoId, repo_name: repo.name, repo_web_url: repo.webUrl, repo_clone_url: repo.cloneUrl });
+    await audit({
+      action: 'repo.created',
+      via: 'system',
+      appId,
+      target: repo.webUrl,
+      detail: { provider: gitProvider().kind, policies: gitProvider().describePolicies() },
+    });
+    void publish(appId, null, 'app.updated', { status: 'ready', repo_web_url: repo.webUrl });
+    void publish(appId, null, 'activity', {
       kind: 'repo',
       title: `Repository ${repo.name} created`,
       detail: gitProvider().describePolicies().join(' · '),
       link: repo.webUrl,
     });
-    const pending = pendingBeforeReady.get(appId) ?? [];
-    pendingBeforeReady.delete(appId);
-    if (pending.length) {
-      const fresh = one<AppRow>('SELECT * FROM applications WHERE id = ?', appId)!;
-      void startRun(appId, kickoffPrompt(fresh, pending.join('\n\n')));
+    if (await one("SELECT 1 FROM runs WHERE app_id = ? AND status = 'queued'", appId)) {
+      await showQueued(appId);
+      await sendControl({ type: 'wake' });
     }
   } catch (err) {
     const message = (err as Error).message;
-    updateApp(appId, { status: 'error', last_error: message });
-    publish(appId, null, 'app.updated', { status: 'error', last_error: message });
-    notify(appId, null, { level: 'error', title: 'Repository provisioning failed', message });
+    await updateApp(appId, { status: 'error', last_error: message });
+    void publish(appId, null, 'app.updated', { status: 'error', last_error: message });
+    void notify(appId, null, { level: 'error', title: 'Repository provisioning failed', message });
   }
 }
 
-// ------------------------------------------------------------------ internals
+/** API boot: provisioning cannot survive a restart (runs are recovered by the workers). */
+export async function recoverAfterRestart() {
+  await run(
+    "UPDATE applications SET status = 'error', last_error = 'Provisioning was interrupted by a server restart — retry it.' WHERE status = 'provisioning'",
+  );
+}
 
-async function prepareWorkspace(app: AppRow): Promise<string> {
+// ------------------------------------------------------------------ worker side
+
+export async function prepareWorkspace(app: AppRow): Promise<string> {
   const ws = path.join(paths.workspaces, app.id);
   const repo: RepoInfo = { repoId: app.repo_id!, name: app.repo_name!, webUrl: app.repo_web_url!, cloneUrl: app.repo_clone_url! };
   if (!fs.existsSync(path.join(ws, '.git'))) {
@@ -150,95 +231,204 @@ async function prepareWorkspace(app: AppRow): Promise<string> {
   return ws;
 }
 
-/** Defence in depth: the real protection is the server-side branch policy, this just fails fast and explains. */
-function guardHook(workspace: string): HookCallback {
-  return async (input) => {
-    if (input.hook_event_name !== 'PreToolUse') return {};
-    const deny = (reason: string) => ({
-      hookSpecificOutput: { hookEventName: 'PreToolUse' as const, permissionDecision: 'deny' as const, permissionDecisionReason: reason },
-    });
-    const ti = input.tool_input as Record<string, unknown>;
-    if (input.tool_name === 'Bash') {
-      const cmd = String(ti.command ?? '');
-      if (/\bgit\b[^|;&]*\bpush\b/.test(cmd)) {
-        if (/(\s|:)(refs\/heads\/)?(main|master)\b/.test(cmd))
-          return deny('main is protected by branch policy. Push a feature branch and open a pull request instead.');
-        if (/\s(-f|--force|--force-with-lease|--mirror|--delete|-d)\b/.test(cmd) || /\s\+\S+/.test(cmd))
-          return deny('Force pushes, mirror pushes and remote branch deletion are not allowed.');
-      }
-      if (/\b(kubectl|helm|az)\b/.test(cmd)) return deny('Use the mcp__blackbox__* tools for cluster and Azure operations.');
-      if (/http\.[^\s]*extraheader/i.test(cmd)) return deny('Do not read or modify git credentials.');
-    }
-    if (['Write', 'Edit', 'NotebookEdit'].includes(input.tool_name)) {
-      const p = String(ti.file_path ?? ti.notebook_path ?? '');
-      if (p && !path.resolve(workspace, p).startsWith(workspace + path.sep) && path.resolve(workspace, p) !== workspace)
-        return deny(`You may only write inside the workspace ${workspace}.`);
-    }
-    return {};
-  };
+/**
+ * Sandboxed shell commands may read nothing under DATA_DIR (database, kubeconfig-local, other apps'
+ * workspaces and their git credentials) except their own workspace and the agent home; never ~/.kube.
+ */
+export function sandboxFilesystem(app: Pick<AppRow, 'repo_clone_url'>, ws: string) {
+  const denyRead = [config.DATA_DIR, path.join(process.env.HOME ?? '/root', '.kube')];
+  if (config.KUBECONFIG_PATH) denyRead.push(path.resolve(config.KUBECONFIG_PATH));
+  const allowRead = [ws, agentHome];
+  // local provider: the agent fetches from its own bare repository (read-only: writing would let it edit the hook)
+  if (app.repo_clone_url?.startsWith(paths.localRepos)) allowRead.push(app.repo_clone_url);
+  return { allowWrite: [ws, '/tmp'], denyRead, allowRead };
 }
 
-function describeTool(name: string, input: Record<string, unknown>, ws: string): { kind: string; title: string; detail?: string } | null {
-  const rel = (p: unknown) => (typeof p === 'string' ? path.relative(ws, path.resolve(ws, p)) || '.' : '');
-  switch (name) {
-    case 'Bash': {
-      const cmd = String(input.command ?? '');
-      const kind = /\bgit\b/.test(cmd) ? 'git' : /\b(test|jest|vitest|pytest|go test|npm (run )?test)\b/.test(cmd) ? 'test' : 'shell';
-      return { kind, title: String(input.description ?? cmd.split('\n')[0]).slice(0, 140), detail: cmd.slice(0, 2000) };
+interface ActiveRun {
+  runId: string;
+  appId: string;
+  stream: PromptStream;
+  q?: Query;
+  abort: AbortController;
+  delivered: Set<string>;
+  stopped: boolean;
+  startedAt: number;
+  span: Span;
+}
+
+export const WORKER_ID = config.WORKER_ID ?? os.hostname();
+const capacity = () => config.WORKER_CONCURRENCY ?? config.AGENT_MAX_CONCURRENT_RUNS;
+const HEARTBEAT_MS = 15_000;
+const STALE_MS = 4 * HEARTBEAT_MS;
+const CLAIM_LOCK = 726201;
+
+/** Runs executing in this process, by run id. */
+const active = new Map<string, ActiveRun>();
+let started = false;
+
+/** Start claiming and executing queued runs in this process. */
+export async function startScheduler() {
+  if (started) return;
+  started = true;
+  // Runs this worker owned before it restarted (and legacy runs without an owner).
+  await recoverInterrupted(await all<RunRow>("SELECT * FROM runs WHERE status = 'running' AND (worker = ? OR worker IS NULL)", WORKER_ID));
+  await run(
+    "UPDATE applications SET status = 'idle' WHERE status = 'running' AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.app_id = applications.id AND r.status = 'running')",
+  );
+  onControl((c) => void onSignal(c).catch((err) => console.warn('[runner] control signal failed', err)));
+  setInterval(() => void tick(), 3000).unref();
+  setInterval(
+    () => void run("UPDATE runs SET heartbeat_at = ? WHERE worker = ? AND status = 'running'", iso(), WORKER_ID).catch(() => undefined),
+    HEARTBEAT_MS,
+  ).unref();
+  setInterval(() => void sweepStale().catch((err) => console.warn('[runner] stale sweep failed', err)), 30_000).unref();
+  void tick();
+}
+
+async function onSignal(c: ControlSignal) {
+  if (c.type === 'wake') return tick();
+  const h = active.get(c.runId);
+  if (!h) return; // another worker's run
+  if (c.type === 'stop') {
+    h.stopped = true;
+    h.stream.close();
+    try {
+      await h.q?.interrupt();
+    } catch {
+      h.abort.abort();
     }
-    case 'Write':
-      return { kind: 'edit', title: `Created ${rel(input.file_path)}` };
-    case 'Edit':
-      return { kind: 'edit', title: `Edited ${rel(input.file_path)}` };
-    case 'Read':
-      return { kind: 'read', title: `Read ${rel(input.file_path)}` };
-    case 'Glob':
-    case 'Grep':
-      return { kind: 'read', title: `Searched for ${String(input.pattern ?? '')}`.slice(0, 140) };
-    case 'WebSearch':
-      return { kind: 'web', title: `Searched the web: ${String(input.query ?? '')}` };
-    case 'WebFetch':
-      return { kind: 'web', title: `Read ${String(input.url ?? '')}` };
-    case 'Agent':
-    case 'Task':
-      return { kind: 'delegate', title: `Building: ${String(input.description ?? 'next step')}`, detail: String(input.prompt ?? '').slice(0, 3000) || undefined };
-    case 'TodoWrite':
-      return null; // rendered as a plan, see below
-    default:
-      if (name.startsWith('mcp__blackbox__')) return null; // those tools publish their own events
-      return { kind: 'tool', title: name };
+    return;
+  }
+  if (h.delivered.has(c.messageId)) return;
+  const msg = await one<MessageRow>('SELECT * FROM messages WHERE id = ?', c.messageId);
+  if (!msg) return;
+  // Fold into the running session: the agent sees it at its next step. Too late (stream closed) → the
+  // message stays undelivered and the end-of-run sweep queues it for the next run.
+  if (!h.stream.push(promptContent(FEEDBACK_PREFIX + msg.content, attachmentBlocks(h.appId, msg)))) return;
+  h.delivered.add(msg.id);
+  void publish(h.appId, h.runId, 'activity', { kind: 'feedback', title: 'Your message was delivered to the agent' });
+}
+
+let ticking = false;
+let again = false;
+async function tick() {
+  if (ticking) {
+    again = true;
+    return;
+  }
+  ticking = true;
+  try {
+    do {
+      again = false;
+      while (active.size < capacity()) {
+        const next = await claim();
+        if (!next) break;
+        void executeRun(next);
+      }
+    } while (again);
+  } catch (err) {
+    console.warn('[runner] scheduling failed', err);
+  } finally {
+    ticking = false;
   }
 }
 
-async function startRun(appId: string, prompt: string) {
-  if (active.has(appId)) return;
-  const runId = newId();
+/** Claim the oldest queued run allowed by the limits: global, per user, one per application. */
+function claim() {
+  return withLock(CLAIM_LOCK, async (d) => {
+    const running = (await d.query<{ n: number }>("SELECT count(*) AS n FROM runs WHERE status = 'running'")).rows[0]!.n;
+    if (Number(running) >= config.AGENT_MAX_CONCURRENT_RUNS) return null;
+    const next = (
+      await d.query<RunRow>(
+        `SELECT r.* FROM runs r JOIN applications a ON a.id = r.app_id
+         WHERE r.status = 'queued' AND a.repo_id IS NOT NULL AND a.status != 'archived'
+           AND NOT EXISTS (SELECT 1 FROM runs x WHERE x.app_id = r.app_id AND x.status = 'running')
+           AND (SELECT count(*) FROM runs x JOIN applications b ON b.id = x.app_id WHERE x.status = 'running' AND b.owner_id = a.owner_id) < ?
+         ORDER BY r.queued_at, r.started_at LIMIT 1`,
+        [config.AGENT_MAX_RUNS_PER_USER],
+      )
+    ).rows[0];
+    if (!next) return null;
+    const now = iso();
+    await d.query("UPDATE runs SET status = 'running', worker = ?, heartbeat_at = ?, started_at = ? WHERE id = ? AND status = 'queued'", [
+      WORKER_ID,
+      now,
+      now,
+      next.id,
+    ]);
+    return next;
+  });
+}
+
+/** Runs whose worker stopped heart-beating (pod killed) are recovered by any live worker. */
+async function sweepStale() {
+  const cutoff = new Date(Date.now() - STALE_MS).toISOString();
+  const stale = await all<RunRow>("SELECT * FROM runs WHERE status = 'running' AND (heartbeat_at IS NULL OR heartbeat_at < ?)", cutoff);
+  await recoverInterrupted(stale.filter((r) => !active.has(r.id)));
+}
+
+/** Interrupted runs: resumed in the same agent session (AGENT_RESUME_INTERRUPTED) or stopped. */
+async function recoverInterrupted(runs: RunRow[]) {
+  for (const r of runs) {
+    const changed = await run(
+      "UPDATE runs SET status = 'stopped', ended_at = ?, summary = 'Interrupted by a server restart' WHERE id = ? AND status = 'running'",
+      iso(),
+      r.id,
+    );
+    if (!changed.changes) continue;
+    void publish(r.app_id, r.id, 'run.finished', { status: 'stopped' });
+    if (config.AGENT_RESUME_INTERRUPTED) {
+      await queuedRun(r.app_id, RESUME_PROMPT);
+      await addMessage(r.app_id, 'system', 'The platform restarted while the agent was working. It resumes automatically where it stopped.');
+      await updateApp(r.app_id, { status: 'queued' });
+      void publish(r.app_id, null, 'app.updated', { status: 'queued' });
+      await sendControl({ type: 'wake' });
+    } else {
+      await addMessage(r.app_id, 'system', 'The platform restarted while the agent was working. Send a message to let it continue where it stopped.');
+      await updateApp(r.app_id, { status: 'idle' });
+      void publish(r.app_id, null, 'app.updated', { status: 'idle' });
+    }
+  }
+}
+
+async function executeRun(r: RunRow) {
+  const appId = r.app_id;
+  const runId = r.id;
   const stream = new PromptStream();
   const abort = new AbortController();
-  const handle: ActiveRun = { runId, stream, abort };
-  active.set(appId, handle);
+  const span = tracer.startSpan('agent.run', { attributes: { 'blackbox.app_id': appId, 'blackbox.run_id': runId, 'blackbox.worker': WORKER_ID } });
+  const handle: ActiveRun = { runId, appId, stream, abort, delivered: new Set(), stopped: false, startedAt: Date.now(), span };
+  active.set(runId, handle);
 
-  run(`INSERT INTO runs (id, app_id, status) VALUES (?, ?, 'running')`, runId, appId);
-  updateApp(appId, { status: 'running' });
-  publish(appId, runId, 'run.started', {});
-  publish(appId, runId, 'app.updated', { status: 'running' });
-
-  let finalStatus: 'succeeded' | 'failed' | 'stopped' = 'succeeded';
-  let summary = '';
-  let cost: number | null = null;
-  let turns: number | null = null;
-  let bufferedText = '';
-  let reported = false;
-
-  const flushNarration = () => {
-    if (bufferedText.trim()) publish(appId, runId, 'activity', { kind: 'narration', title: bufferedText.trim().slice(0, 4000) });
-    bufferedText = '';
-  };
+  // Sink writes are not awaited by the mapper; they are awaited before the run is closed.
+  const writes: Promise<unknown>[] = [];
+  const rec = new RunRecorder(
+    {
+      activity: (p) => void writes.push(publish(appId, runId, 'activity', p)),
+      message: (role, content) => void writes.push(addMessage(appId, role, content, runId)),
+      session: (id) => void writes.push(updateApp(appId, { agent_session_id: id })),
+    },
+    path.join(paths.workspaces, appId),
+    config.AGENT_MAX_BUDGET_USD,
+  );
 
   try {
-    const app = one<AppRow>('SELECT * FROM applications WHERE id = ?', appId)!;
+    const app = (await one<AppRow>('SELECT * FROM applications WHERE id = ?', appId))!;
+    const msgs = await all<MessageRow>("SELECT * FROM messages WHERE run_id = ? AND role = 'user' ORDER BY created_at, id", runId);
+    msgs.forEach((m) => handle.delivered.add(m.id));
+    const text = [r.prompt, ...msgs.map((m) => m.content)].filter(Boolean).join('\n\n');
+    if (!text) {
+      await run('DELETE FROM runs WHERE id = ?', runId); // its messages moved to another run
+      return;
+    }
+    await updateApp(appId, { status: 'running' });
+    metrics.runStarted();
+    void publish(appId, runId, 'run.started', {});
+    void publish(appId, runId, 'app.updated', { status: 'running' });
+
     const ws = await prepareWorkspace(app);
-    stream.push(prompt);
+    const blocks = msgs.flatMap((m) => attachmentBlocks(appId, m));
+    stream.push(promptContent(app.agent_session_id ? text : kickoffPrompt(app, text), blocks));
 
     const q = query({
       prompt: stream,
@@ -254,8 +444,18 @@ async function startRun(appId: string, prompt: string) {
         abortController: abort,
         systemPrompt: { type: 'preset', preset: 'claude_code', append: systemPromptAppend(app) },
         tools: PLANNER_TOOLS,
-        disallowedTools: ['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode', 'EnterWorktree', 'ExitWorktree', 'CronCreate', 'CronDelete', 'RemoteTrigger', 'PushNotification'],
-        mcpServers: { blackbox: blackboxTools({ app, runId, workspace: ws }) },
+        disallowedTools: [
+          'AskUserQuestion',
+          'EnterPlanMode',
+          'ExitPlanMode',
+          'EnterWorktree',
+          'ExitWorktree',
+          'CronCreate',
+          'CronDelete',
+          'RemoteTrigger',
+          'PushNotification',
+        ],
+        mcpServers: { blackbox: blackboxTools({ app, runId, workspace: ws, span }) },
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
         settingSources: [],
@@ -265,7 +465,7 @@ async function startRun(appId: string, prompt: string) {
               enabled: true,
               failIfUnavailable: false,
               autoAllowBashIfSandboxed: true,
-              filesystem: { allowWrite: [ws, '/tmp'], denyRead: [config.DATA_DIR + '/blackbox.db', path.join(process.env.HOME ?? '/root', '.kube')] },
+              filesystem: sandboxFilesystem(app, ws),
             }
           : undefined,
         env: {
@@ -283,100 +483,58 @@ async function startRun(appId: string, prompt: string) {
     handle.q = q;
 
     for await (const msg of q as AsyncIterable<SDKMessage>) {
-      if ('session_id' in msg && msg.session_id && msg.type === 'system' && msg.subtype === 'init') {
-        updateApp(appId, { agent_session_id: msg.session_id });
-      }
-
-      // Coder (subagent) steps: shown as technical activity attributed to the coder.
-      if (msg.type === 'assistant' && msg.parent_tool_use_id !== null) {
-        for (const block of msg.message.content) {
-          if (block.type !== 'tool_use' || block.name === 'TodoWrite') continue;
-          const d = describeTool(block.name, (block.input ?? {}) as Record<string, unknown>, ws);
-          if (d) publish(appId, runId, 'activity', { ...d, actor: 'coder', toolUseId: block.id });
-        }
-      }
-
-      if (msg.type === 'assistant' && msg.parent_tool_use_id === null) {
-        for (const block of msg.message.content) {
-          if (block.type === 'text') {
-            bufferedText += (bufferedText ? '\n\n' : '') + block.text;
-          } else if (block.type === 'tool_use') {
-            flushNarration();
-            const input = (block.input ?? {}) as Record<string, unknown>;
-            if (block.name === 'TodoWrite' && Array.isArray(input.todos)) {
-              publish(appId, runId, 'activity', { kind: 'plan', title: 'Plan updated', todos: input.todos });
-              continue;
-            }
-            const d = describeTool(block.name, input, ws);
-            if (d) publish(appId, runId, 'activity', { ...d, actor: 'planner', toolUseId: block.id });
-          }
-        }
-      }
-
-      if (msg.type === 'user' && msg.parent_tool_use_id === null && Array.isArray(msg.message.content)) {
-        for (const block of msg.message.content) {
-          if (typeof block === 'object' && block.type === 'tool_result' && block.is_error) {
-            const text = Array.isArray(block.content) ? block.content.map((c) => ('text' in c ? c.text : '')).join('\n') : String(block.content ?? '');
-            publish(appId, runId, 'activity', { kind: 'error', title: 'A step failed — the agent will handle it', detail: text.slice(0, 2000), toolUseId: block.tool_use_id });
-          }
-        }
-      }
-
-      if (msg.type === 'result') {
-        cost = msg.total_cost_usd;
-        turns = msg.num_turns;
-        if (msg.subtype === 'success' && msg.is_error) {
-          // API-level failure (auth, overload…) surfaced as a result; the SDK throws right after.
-          finalStatus = 'failed';
-          summary = msg.result || 'The agent hit an API error.';
-          reported = true;
-          bufferedText = '';
-          addMessage(appId, 'system', `The agent hit an error: ${summary}`, runId);
-        } else if (msg.subtype === 'success') {
-          summary = bufferedText.trim() || msg.result;
-          bufferedText = '';
-          if (summary) addMessage(appId, 'assistant', summary, runId);
-        } else {
-          flushNarration();
-          finalStatus = 'failed';
-          summary = {
-            error_max_turns: 'I reached the maximum number of steps for one run.',
-            error_max_budget_usd: `I reached the budget limit for one run ($${config.AGENT_MAX_BUDGET_USD}).`,
-            error_during_execution: 'The run stopped because of an execution error.',
-            error_max_structured_output_retries: 'The run failed.',
-          }[msg.subtype];
-          addMessage(appId, 'assistant', `${summary} Send a message to let me continue where I stopped.`, runId);
-        }
-        // No feedback arrived during the turn → end the session; otherwise the next turn starts automatically.
-        if (stream.pending === 0) stream.close();
-      }
+      // No feedback arrived during the turn → end the session; otherwise the next turn starts automatically.
+      if (rec.handle(msg) && stream.pending === 0) stream.close();
     }
   } catch (err) {
-    flushNarration();
-    if (abort.signal.aborted) finalStatus = 'stopped';
-    else if (!reported) {
-      finalStatus = 'failed';
-      summary = (err as Error).message;
-      addMessage(appId, 'system', `The agent crashed: ${summary}`, runId);
-    }
+    rec.crashed(err as Error, abort.signal.aborted || handle.stopped);
   } finally {
-    active.delete(appId);
+    active.delete(runId);
     stream.close();
-    run(`UPDATE runs SET status = ?, cost_usd = ?, num_turns = ?, summary = ?, ended_at = datetime('now') WHERE id = ?`, finalStatus, cost, turns, summary.slice(0, 4000), runId);
-    updateApp(appId, { status: finalStatus === 'failed' ? 'error' : 'idle', phase: finalStatus === 'succeeded' ? 'done' : null, last_error: finalStatus === 'failed' ? summary.slice(0, 1000) : null });
-    publish(appId, runId, 'run.finished', { status: finalStatus, costUsd: cost, turns });
-    publish(appId, runId, 'app.updated', { status: finalStatus === 'failed' ? 'error' : 'idle' });
-    notify(appId, runId, {
-      level: finalStatus === 'succeeded' ? 'success' : finalStatus === 'stopped' ? 'info' : 'error',
-      title: finalStatus === 'succeeded' ? 'The agent finished — your feedback is welcome' : finalStatus === 'stopped' ? 'Agent stopped' : 'The agent stopped with an error',
-      message: summary.split('\n')[0]?.slice(0, 280) || '',
-    });
+    await Promise.allSettled(writes);
+    await finishRun(handle, rec).catch((err) => console.error('[runner] could not close run', runId, err));
+    span.setAttributes({ 'blackbox.status': rec.status, 'blackbox.cost_usd': rec.cost ?? 0, 'blackbox.turns': rec.turns ?? 0 });
+    if (rec.status === 'failed') span.setStatus({ code: SpanStatusCode.ERROR, message: rec.summary.slice(0, 200) });
+    span.end();
+    void tick();
   }
 }
 
-/** On boot, in-flight runs are marked interrupted (a new message resumes the agent session). */
-export function recoverAfterRestart() {
-  run(`UPDATE runs SET status = 'stopped', ended_at = datetime('now'), summary = 'Interrupted by a server restart' WHERE status = 'running'`);
-  run(`UPDATE applications SET status = 'idle' WHERE status = 'running'`);
-  run(`UPDATE applications SET status = 'error', last_error = 'Provisioning was interrupted by a server restart — retry it.' WHERE status = 'provisioning'`);
+async function finishRun(h: ActiveRun, rec: RunRecorder) {
+  const { appId, runId } = h;
+  const exists = await one('SELECT 1 FROM runs WHERE id = ?', runId);
+  if (!exists) return; // empty run, deleted
+  const { status, summary, cost, turns } = rec;
+  metrics.runFinished({ status, seconds: (Date.now() - h.startedAt) / 1000, cost, inputTokens: rec.inputTokens, outputTokens: rec.outputTokens });
+  await run(
+    `UPDATE runs SET status = ?, cost_usd = ?, num_turns = ?, summary = ?, ended_at = ? WHERE id = ?`,
+    status,
+    cost,
+    turns,
+    summary.slice(0, 4000),
+    iso(),
+    runId,
+  );
+  // Messages that arrived too late for this run go to the next one (unless the user stopped the agent).
+  if (!h.stopped)
+    for (const m of await all<{ id: string }>("SELECT id FROM messages WHERE run_id = ? AND role = 'user'", runId))
+      if (!h.delivered.has(m.id)) await requeueMessage(appId, m.id, runId);
+  const next = await one("SELECT 1 FROM runs WHERE app_id = ? AND status = 'queued'", appId);
+  const appStatus = next ? 'queued' : status === 'failed' ? 'error' : 'idle';
+  await updateApp(appId, {
+    status: appStatus,
+    phase: status === 'succeeded' ? 'done' : null,
+    last_error: status === 'failed' ? summary.slice(0, 1000) : null,
+  });
+  void publish(appId, runId, 'run.finished', { status, costUsd: cost, turns });
+  void publish(appId, runId, 'app.updated', { status: appStatus });
+  void notify(appId, runId, {
+    level: status === 'succeeded' ? 'success' : status === 'stopped' ? 'info' : 'error',
+    title:
+      status === 'succeeded' ? 'The agent finished — your feedback is welcome' : status === 'stopped' ? 'Agent stopped' : 'The agent stopped with an error',
+    message: summary.split('\n')[0]?.slice(0, 280) || '',
+  });
 }
+
+/** Test helper: is a run of this app executing in this process? */
+export const isRunning = (appId: string) => [...active.values()].some((h) => h.appId === appId);

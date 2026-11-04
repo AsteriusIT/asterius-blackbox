@@ -30,7 +30,13 @@ export function Toasts({ toasts, onDismiss, onOpen }: { toasts: Toast[]; onDismi
                   Open <Icon name="external" size={14} />
                 </a>
               )}
-              <button className="btn btn-soft btn-sm" onClick={() => { onOpen(t.appId); onDismiss(t.id); }}>
+              <button
+                className="btn btn-soft btn-sm"
+                onClick={() => {
+                  onOpen(t.appId);
+                  onDismiss(t.id);
+                }}
+              >
                 View
               </button>
             </div>

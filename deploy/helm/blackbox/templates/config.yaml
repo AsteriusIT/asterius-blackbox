@@ -1,0 +1,82 @@
+{{- $v := .Values -}}
+{{- if and (or $v.workers.enabled (gt (int $v.api.replicas) 1)) (not $v.database.url) (not $v.existingSecret) }}
+{{- fail "workers.enabled or api.replicas > 1 needs Postgres: set database.url (or DATABASE_URL in existingSecret)" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+  labels: {{- include "blackbox.labels" . | nindent 4 }}
+data:
+  PUBLIC_URL: {{ $v.publicUrl | quote }}
+  AGENT_PLANNER_MODEL: {{ $v.agent.plannerModel | quote }}
+  AGENT_CODER_MODEL: {{ $v.agent.coderModel | quote }}
+  AGENT_MAX_BUDGET_USD: {{ $v.agent.maxBudgetUsd | quote }}
+  AGENT_MAX_CONCURRENT_RUNS: {{ $v.agent.maxConcurrentRuns | quote }}
+  AGENT_MAX_RUNS_PER_USER: {{ $v.agent.maxRunsPerUser | quote }}
+  AGENT_RESUME_INTERRUPTED: {{ $v.agent.resumeInterrupted | quote }}
+  AGENT_SANDBOX: {{ $v.agent.sandbox | quote }}
+  AUTH_PROVIDERS: {{ $v.auth.providers | quote }}
+  ALLOW_REGISTRATION: {{ $v.auth.allowRegistration | quote }}
+  {{- with $v.auth.entra.tenantId }}
+  ENTRA_TENANT_ID: {{ . | quote }}
+  {{- end }}
+  {{- with $v.auth.entra.clientId }}
+  ENTRA_CLIENT_ID: {{ . | quote }}
+  {{- end }}
+  {{- if $v.azureDevOps.enabled }}
+  GIT_PROVIDER: azure-devops
+  ADO_ORG_URL: {{ $v.azureDevOps.orgUrl | quote }}
+  ADO_PROJECT: {{ $v.azureDevOps.project | quote }}
+  ADO_MIN_REVIEWERS: {{ $v.azureDevOps.minReviewers | quote }}
+  ADO_BUILD_VALIDATION: {{ $v.azureDevOps.buildValidation | quote }}
+  {{- with $v.azureDevOps.requiredReviewerId }}
+  ADO_REQUIRED_REVIEWER_ID: {{ . | quote }}
+  {{- end }}
+  {{- else if $v.github.enabled }}
+  GIT_PROVIDER: github
+  GITHUB_OWNER: {{ $v.github.owner | quote }}
+  GITHUB_MIN_REVIEWERS: {{ $v.github.minReviewers | quote }}
+  {{- else }}
+  GIT_PROVIDER: local
+  {{- end }}
+  K8S_ENABLED: {{ $v.kubernetes.enabled | quote }}
+  {{- if $v.kubernetes.enabled }}
+  K8S_IMAGE_REGISTRY: {{ $v.kubernetes.imageRegistry | quote }}
+  K8S_BASE_DOMAIN: {{ $v.kubernetes.baseDomain | quote }}
+  K8S_INGRESS_CLASS: {{ $v.kubernetes.ingressClass | quote }}
+  K8S_INGRESS_NAMESPACE: {{ $v.kubernetes.ingressNamespace | quote }}
+  K8S_ENV_TTL_HOURS: {{ $v.kubernetes.envTtlHours | quote }}
+  K8S_PREVIEW_EGRESS: {{ $v.kubernetes.previewEgress | quote }}
+  K8S_PREVIEW_EGRESS_ALLOWLIST: {{ $v.kubernetes.previewEgressAllowlist | quote }}
+  K8S_BUILD_NAMESPACE: {{ $v.kubernetes.buildNamespace | quote }}
+  {{- with $v.kubernetes.clusterIssuer }}
+  K8S_CLUSTER_ISSUER: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+  {{- if $v.port.enabled }}
+  PORT_API_URL: {{ $v.port.apiUrl | quote }}
+  PORT_ACTIONS_ENABLED: {{ $v.port.actionsEnabled | quote }}
+  {{- with $v.port.defaultTeam }}
+  PORT_DEFAULT_TEAM: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+  {{- range $k, $val := $v.extraEnv }}
+  {{ $k }}: {{ $val | quote }}
+  {{- end }}
+{{- if or $v.secrets $v.database.url }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Release.Name }}-secrets
+  labels: {{- include "blackbox.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  {{- with $v.database.url }}
+  DATABASE_URL: {{ . | quote }}
+  {{- end }}
+  {{- range $k, $val := $v.secrets }}
+  {{ $k }}: {{ $val | quote }}
+  {{- end }}
+{{- end }}

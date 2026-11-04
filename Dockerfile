@@ -4,6 +4,7 @@ WORKDIR /src
 COPY package.json package-lock.json ./
 COPY apps/server/package.json apps/server/
 COPY apps/web/package.json apps/web/
+COPY packages/shared/package.json packages/shared/
 RUN npm ci
 COPY . .
 RUN npm run build && npm prune --omit=dev
@@ -23,6 +24,7 @@ WORKDIR /app
 COPY --from=build /src/node_modules ./node_modules
 COPY --from=build /src/apps/server/package.json ./apps/server/
 COPY --from=build /src/apps/server/dist ./apps/server/dist
+COPY --from=build /src/apps/server/templates ./apps/server/templates
 COPY --from=build /src/apps/web/dist ./apps/web/dist
 RUN useradd -m -u 10001 blackbox && mkdir -p /data && chown blackbox /data
 USER blackbox

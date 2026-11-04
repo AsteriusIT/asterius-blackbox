@@ -41,6 +41,9 @@ else
   NEW_APP=0
 fi
 
+# Security-group object ids in the ID token: lets owners share an application with an Entra group.
+az ad app update --id "$APP_ID" --set groupMembershipClaims=SecurityGroup >/dev/null
+
 # Service principal (enterprise application) in the tenant.
 az ad sp show --id "$APP_ID" >/dev/null 2>&1 || { echo "→ creating service principal"; az ad sp create --id "$APP_ID" >/dev/null; }
 

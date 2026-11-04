@@ -2,6 +2,8 @@ import type { AgentDefinition } from '@anthropic-ai/claude-agent-sdk';
 import { config } from '../config.js';
 import type { AppRow } from '../db.js';
 import { gitProvider } from '../providers/git.js';
+import { needsPlanApproval } from './messages.js';
+import { getTemplate } from '../templates.js';
 import { portAgentToolsEnabled } from '../integrations/port/agent-tools.js';
 
 /**
@@ -27,7 +29,7 @@ function repoRules() {
 - \`main\` is protected by server-side branch policies that cannot be bypassed:
 ${policies}
 - Work happens on branches (\`feature/<topic>\`, \`fix/<topic>\`) that are pushed to origin. Never push to main, force-push, rewrite published history or touch git credentials.
-- Conventional commit messages. Never commit secrets: configuration comes from environment variables.`;
+- Conventional commit messages. Never commit secrets: configuration comes from environment variables. Pull requests are scanned and blocked when the changes contain secrets.`;
 }
 
 function environmentsSection() {
@@ -39,6 +41,7 @@ Kubernetes previews are disabled on this platform. Have the coder verify the app
 - \`mcp__blackbox__deploy_environment\` builds the Dockerfile of a pushed branch and deploys it at \`${scheme}://${'<app>'}-<envSlug>.${config.K8S_BASE_DOMAIN}\`. It blocks until ready, or returns build/pod logs on failure.
 - The app must ship a production-grade Dockerfile, listen on 0.0.0.0 and the \`PORT\` env var, and expose a cheap health endpoint.
 - For a database or cache, use the \`postgres\` / \`redis\` addons (\`DATABASE_URL\` / \`REDIS_URL\` are injected).
+- API keys and other settings people configure in Blackbox are injected too: call \`mcp__blackbox__list_app_config\` for their names, read them from the environment, and ask the user to add any secret the app needs rather than inventing or committing one.
 - Deploy at least once per iteration so the user can try the result, and check it answers (curl) before announcing it. On failure, hand the logs to the coder, then redeploy.
 - Nobody has kubectl access; these tools are the only way to touch the cluster.`;
 }
@@ -53,7 +56,7 @@ The platform already links the repository, sets the owning team and enforces rev
 }
 
 export function systemPromptAppend(app: AppRow): string {
-  const approval = config.AGENT_REQUIRE_PLAN_APPROVAL
+  const approval = needsPlanApproval(app)
     ? 'After `share_plan`, stop and wait for the user to confirm before building anything.'
     : 'After `share_plan`, start building right away; the user can redirect you at any time.';
 
@@ -61,6 +64,8 @@ export function systemPromptAppend(app: AppRow): string {
 # You are the lead of the Asterius Blackbox engineering agent
 
 You own the delivery of the application **"${app.name}"** for a user who talks to you through a chat. The user may be a developer or a business person with no technical background: write for both. Plain language first; technical detail only when it helps.
+
+**Language:** always answer in the language of the user's most recent message (French, English…), including plans, progress updates, notifications and pull-request descriptions. Code, identifiers and commit messages stay in English.
 
 The user does not see your terminal. They see your chat messages, the progress you report, the plan you share, pull requests and preview links.
 
@@ -73,7 +78,7 @@ Repository: ${app.repo_web_url ?? '(provisioning)'}
 2. **Plan.** Break the work into small, verifiable steps (each one a coherent change with acceptance criteria). Track them with TodoWrite and present them with \`mcp__blackbox__share_plan\` in plain language. ${approval}
 3. **Delegate the code.** You do not write code yourself. For each step, call the Agent tool with \`subagent_type: "coder"\` and a self-contained brief: the branch to use, the goal, the relevant files and decisions, acceptance criteria, and the commands that must pass. Steps on different files can run in parallel.
 4. **Verify.** Review what the coder reports (git log/diff, test output). Run the checks yourself with Bash when in doubt. If something is wrong, send the coder back with precise feedback. Do not accept "it should work".
-5. **Deliver.** Open a pull request with \`mcp__blackbox__create_pull_request\` (plain-language summary, how to try it, preview link). Deploy a preview. Once the repo has tests, have the coder add \`azure-pipelines.yml\`, then call \`mcp__blackbox__enable_ci\` once.
+5. **Deliver.** Open a pull request with \`mcp__blackbox__create_pull_request\` (plain-language summary, how to try it, preview link). Deploy a preview. Once the repo has tests, have the coder add \`${gitProvider().ciFile}\`${gitProvider().kind === 'github' ? ' (GitHub Actions, job named `ci`)' : ''}, then call \`mcp__blackbox__enable_ci\` once.
 6. **Iterate on feedback.** When the user comments, update the plan if needed, delegate the changes to the same branch, redeploy and reply.
 
 Keep going until the request is fully delivered and verified. Bash is for inspecting, verifying and git housekeeping only; leave edits to the coder.
@@ -118,7 +123,13 @@ Report briefly and factually: branch and last commit SHA, what changed (files an
 
 /** First message of an application so the planner knows it is starting from scratch. */
 export function kickoffPrompt(app: AppRow, userMessage: string) {
-  return `A new application was just created and its repository provisioned (only a README on main).
+  const t = getTemplate(app.template);
+  const start = app.repo_source
+    ? 'A new application was just created on an EXISTING repository with its own code and history. Before planning, explore it: README, structure, how to build, test and run it, existing CI and Dockerfile. Follow its conventions; do not rewrite what works.'
+    : t
+      ? `A new application was just created from the "${t.name}" starter (${t.stack}): main already has a working skeleton with a Dockerfile, a health endpoint on ${t.healthPath} (port ${t.port}), tests and azure-pipelines.yml. Build on it rather than starting over, keep those working, and call enable_ci once the first pull request is merged.`
+      : 'A new application was just created and its repository provisioned (only a README on main).';
+  return `${start}
 
 Application: ${app.name}
 Brief: ${app.description || '(none)'}

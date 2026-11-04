@@ -1,0 +1,9 @@
+trigger: [main]
+pool: { vmImage: ubuntu-latest }
+steps:
+  - task: UseDotNet@2
+    inputs: { version: '9.x' }
+  - script: dotnet build -c Release
+    displayName: Build
+  - script: docker build -t app .
+    displayName: Docker build

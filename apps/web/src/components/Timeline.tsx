@@ -1,3 +1,4 @@
+import { t } from '../lib/i18n';
 import { useMemo, useState } from 'react';
 import type { BlackboxEvent } from '../lib/api';
 import { phaseLabel } from '../lib/labels';
@@ -43,7 +44,7 @@ export function Timeline({ events, running }: { events: BlackboxEvent[]; running
     <div className="timeline">
       {checklist && running && (
         <section className="checklist">
-          <h4>Checklist</h4>
+          <h4>{t('Checklist')}</h4>
           <ul>
             {(checklist.payload.todos as { content: string; status: string }[]).map((t, i) => (
               <li key={i} className={`todo todo-${t.status}`}>
@@ -56,11 +57,11 @@ export function Timeline({ events, running }: { events: BlackboxEvent[]; running
       )}
 
       <div className="timeline-head">
-        <h4>Latest updates</h4>
+        <h4>{t('Latest updates')}</h4>
         <label className="switch">
           <input type="checkbox" checked={technical} onChange={(e) => setTechnical(e.target.checked)} />
           <span className="switch-track" />
-          Technical details
+          {t('Technical details')}
         </label>
       </div>
 
@@ -68,7 +69,7 @@ export function Timeline({ events, running }: { events: BlackboxEvent[]; running
         {items.map((e) => (
           <FeedItem key={e.seq} e={e} />
         ))}
-        {items.length === 0 && <li className="feed-empty">Updates will appear here as the agent works.</li>}
+        {items.length === 0 && <li className="feed-empty">{t('Updates will appear here as the agent works.')}</li>}
       </ol>
     </div>
   );
@@ -95,7 +96,14 @@ function FeedItem({ e }: { e: BlackboxEvent }) {
       <li className="feed-item quiet">
         <span className="feed-dot" />
         <div className="feed-meta">
-          {e.type === 'run.started' ? 'Started working' : p.status === 'succeeded' ? 'Finished' : p.status === 'stopped' ? 'Stopped' : 'Stopped after a problem'} · {time(e.createdAt)}
+          {e.type === 'run.started'
+            ? 'Started working'
+            : p.status === 'succeeded'
+              ? 'Finished'
+              : p.status === 'stopped'
+                ? 'Stopped'
+                : 'Stopped after a problem'}{' '}
+          · {time(e.createdAt)}
           {e.type === 'run.finished' && p.costUsd != null && ` · $${Number(p.costUsd).toFixed(2)}`}
         </div>
       </li>

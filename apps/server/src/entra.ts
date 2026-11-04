@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
-import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from 'jose';
 import { config } from './config.js';
 import { newId, one, run, type UserRow } from './db.js';
 import { createSession } from './auth.js';
@@ -26,16 +26,33 @@ function fail(message: string) {
   return `${config.PUBLIC_URL.replace(/\/$/, '')}/login?error=${encodeURIComponent(message)}`;
 }
 
+/** Verify a Microsoft ID token (signature, issuer, audience, nonce, tenant) and extract the identity. */
+export async function checkIdToken(idToken: string, nonce: string, keySet: JWTVerifyGetKey) {
+  const { payload } = await jwtVerify(idToken, keySet, { issuer: `${authority()}/v2.0`, audience: config.ENTRA_CLIENT_ID });
+  if (payload.nonce !== nonce) throw new Error('nonce mismatch');
+  if (payload.tid !== config.ENTRA_TENANT_ID) throw new Error('wrong tenant');
+  const oid = String(payload.oid ?? '');
+  if (!oid) throw new Error('missing oid claim');
+  const email = String(payload.email ?? payload.preferred_username ?? '').toLowerCase();
+  // `groups` is present when the app registration emits group claims (scripts/entra-app.sh sets SecurityGroup).
+  const groups = Array.isArray(payload.groups) ? payload.groups.map(String) : [];
+  return { externalId: `${payload.tid}:${oid}`, email, name: String(payload.name || email || 'User'), groups };
+}
+
 export async function entraRoutes(app: FastifyInstance) {
   app.get('/api/auth/entra/login', async (req, reply) => {
     const state = b64url(randomBytes(24));
     const nonce = b64url(randomBytes(24));
     const verifier = b64url(randomBytes(48));
     const challenge = b64url(createHash('sha256').update(verifier).digest());
-    run('DELETE FROM oauth_states WHERE expires_at < ?', new Date().toISOString());
-    run(
+    await run('DELETE FROM oauth_states WHERE expires_at < ?', new Date().toISOString());
+    await run(
       'INSERT INTO oauth_states (state, nonce, code_verifier, return_to, expires_at) VALUES (?, ?, ?, ?, ?)',
-      state, nonce, verifier, safeReturnTo((req.query as { returnTo?: string }).returnTo), new Date(Date.now() + 10 * 60_000).toISOString(),
+      state,
+      nonce,
+      verifier,
+      safeReturnTo((req.query as { returnTo?: string }).returnTo),
+      new Date(Date.now() + 10 * 60_000).toISOString(),
     );
     const params = new URLSearchParams({
       client_id: config.ENTRA_CLIENT_ID!,
@@ -57,8 +74,11 @@ export async function entraRoutes(app: FastifyInstance) {
     if (q.error) return reply.redirect(fail(q.error_description?.split('\n')[0] ?? q.error));
     if (!q.code || !q.state) return reply.redirect(fail('Invalid sign-in response'));
 
-    const st = one<{ nonce: string; code_verifier: string; return_to: string; expires_at: string }>('SELECT * FROM oauth_states WHERE state = ?', q.state);
-    run('DELETE FROM oauth_states WHERE state = ?', q.state); // single use
+    const st = await one<{ nonce: string; code_verifier: string; return_to: string; expires_at: string }>(
+      'SELECT * FROM oauth_states WHERE state = ?',
+      q.state,
+    );
+    await run('DELETE FROM oauth_states WHERE state = ?', q.state); // single use
     if (!st || st.expires_at < new Date().toISOString()) return reply.redirect(fail('Your sign-in expired, please try again'));
 
     try {
@@ -78,29 +98,31 @@ export async function entraRoutes(app: FastifyInstance) {
       const tokens = (await res.json()) as { id_token?: string; error?: string; error_description?: string };
       if (!res.ok || !tokens.id_token) throw new Error(tokens.error_description?.split('\n')[0] ?? tokens.error ?? `token endpoint ${res.status}`);
 
-      const { payload } = await jwtVerify(tokens.id_token, keys(), {
-        issuer: `${authority()}/v2.0`,
-        audience: config.ENTRA_CLIENT_ID,
-      });
-      if (payload.nonce !== st.nonce) throw new Error('nonce mismatch');
-      if (payload.tid !== config.ENTRA_TENANT_ID) throw new Error('wrong tenant');
-      const oid = String(payload.oid ?? '');
-      if (!oid) throw new Error('missing oid claim');
+      const { externalId, email, name, groups } = await checkIdToken(tokens.id_token, st.nonce, keys());
 
-      const externalId = `${payload.tid}:${oid}`;
-      const email = String(payload.email ?? payload.preferred_username ?? '').toLowerCase();
-      const name = String(payload.name ?? email ?? 'User');
-
-      let user = one<UserRow>("SELECT * FROM users WHERE provider = 'entra' AND external_id = ?", externalId);
+      let user = await one<UserRow>("SELECT * FROM users WHERE provider = 'entra' AND external_id = ?", externalId);
       if (user) {
-        run("UPDATE users SET email = ?, name = ?, last_login_at = datetime('now') WHERE id = ?", email, name, user.id);
+        await run(
+          "UPDATE users SET email = ?, name = ?, groups = ?, last_login_at = datetime('now') WHERE id = ?",
+          email,
+          name,
+          JSON.stringify(groups),
+          user.id,
+        );
       } else {
         const id = newId();
-        run("INSERT INTO users (id, provider, external_id, email, name, last_login_at) VALUES (?, 'entra', ?, ?, ?, datetime('now'))", id, externalId, email, name);
-        user = one<UserRow>('SELECT * FROM users WHERE id = ?', id)!;
+        await run(
+          "INSERT INTO users (id, provider, external_id, email, name, groups, last_login_at) VALUES (?, 'entra', ?, ?, ?, ?, datetime('now'))",
+          id,
+          externalId,
+          email,
+          name,
+          JSON.stringify(groups),
+        );
+        user = (await one<UserRow>('SELECT * FROM users WHERE id = ?', id))!;
       }
 
-      const token = createSession(user.id);
+      const token = await createSession(user.id);
       // Fragment: never sent to servers or written to access logs.
       const hash = new URLSearchParams({ token, returnTo: st.return_to });
       return reply.redirect(`${config.PUBLIC_URL.replace(/\/$/, '')}/auth/callback#${hash}`);
