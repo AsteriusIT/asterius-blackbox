@@ -16,6 +16,10 @@ const fr: Record<string, string> = {
   Applications: 'Applications',
   'Your applications will appear here.': 'Vos applications apparaîtront ici.',
   'Sign out (Shift+click: sign out everywhere)': 'Se déconnecter (Maj+clic : partout)',
+  'Theme: {theme}': 'Thème : {theme}',
+  Light: 'Clair',
+  Dark: 'Sombre',
+  System: 'Système',
   // statuses & phases
   'Setting up': 'Mise en place',
   Ready: 'Prête',

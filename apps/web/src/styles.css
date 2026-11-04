@@ -19,9 +19,68 @@
   --blue-soft: #edf2fd;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04), 0 1px 6px rgba(0, 0, 0, 0.04);
   --shadow-md: 0 4px 24px rgba(0, 0, 0, 0.07), 0 1px 3px rgba(0, 0, 0, 0.04);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.12), 0 1px 3px rgba(0, 0, 0, 0.06);
+  --card-shadow: 0 0 0 1px rgba(0, 0, 0, 0.05), 0 2px 10px rgba(0, 0, 0, 0.04);
+  --card-shadow-hover: 0 0 0 1px rgba(0, 0, 0, 0.06), 0 10px 30px rgba(0, 0, 0, 0.08);
+  --on-text: #ffffff; /* foreground on var(--text) backgrounds */
+  --border: #e3e3e3; /* inputs, dashed cards */
+  --border-strong: #c9c9c9; /* focused / hovered borders */
+  --border-soft: rgba(0, 0, 0, 0.13); /* chips, spinner track */
+  --line: #e4e4e4; /* dividers, connectors */
+  --muted: #cfcfcf; /* neutral dots, disabled fills, switch track */
+  --overlay: rgba(0, 0, 0, 0.07);
+  --glass: rgba(255, 255, 255, 0.6);
+  --focus-ring: rgba(0, 0, 0, 0.03);
+  --accent-text: #0b6e55;
+  --accent-glow: rgba(16, 163, 127, 0.06);
+  --avatar-bg: #d9ece6;
+  --red-text: #8f2c2c;
+  --green-text: #1a7f37;
+  --code-bg: #f6f6f6;
   --font: 'Inter', 'InterVariable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   --mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
   color-scheme: light;
+}
+/* Dark theme: applied via <html data-theme="dark"> (see lib/theme.ts). */
+:root[data-theme='dark'] {
+  --bg: #212121;
+  --surface: #181818;
+  --surface-2: #2c2c2c;
+  --surface-3: #383838;
+  --text: #ececec;
+  --text-2: #b4b4b4;
+  --text-3: #8a8a8a;
+  --hairline: rgba(255, 255, 255, 0.08);
+  --accent: #10a37f;
+  --accent-hover: #17b78f;
+  --accent-soft: rgba(16, 163, 127, 0.16);
+  --amber: #e2a845;
+  --amber-soft: rgba(226, 168, 69, 0.14);
+  --red: #f07070;
+  --red-soft: rgba(240, 112, 112, 0.14);
+  --blue: #7aa2f2;
+  --blue-soft: rgba(122, 162, 242, 0.15);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3), 0 1px 6px rgba(0, 0, 0, 0.25);
+  --shadow-md: 0 4px 24px rgba(0, 0, 0, 0.4), 0 1px 3px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.06);
+  --card-shadow: 0 0 0 1px rgba(255, 255, 255, 0.07), 0 2px 10px rgba(0, 0, 0, 0.3);
+  --card-shadow-hover: 0 0 0 1px rgba(255, 255, 255, 0.12), 0 10px 30px rgba(0, 0, 0, 0.45);
+  --on-text: #171717;
+  --border: #3a3a3a;
+  --border-strong: #555555;
+  --border-soft: rgba(255, 255, 255, 0.16);
+  --line: #363636;
+  --muted: #4d4d4d;
+  --overlay: rgba(255, 255, 255, 0.1);
+  --glass: rgba(255, 255, 255, 0.05);
+  --focus-ring: rgba(255, 255, 255, 0.05);
+  --accent-text: #4fd1ac;
+  --accent-glow: rgba(16, 163, 127, 0.12);
+  --avatar-bg: rgba(16, 163, 127, 0.22);
+  --red-text: #f5a5a5;
+  --green-text: #56c271;
+  --code-bg: #1a1a1a;
+  color-scheme: dark;
 }
 @supports (font-variation-settings: normal) {
   :root {
@@ -115,7 +174,7 @@ button {
 }
 .btn-dark {
   background: var(--text);
-  color: #fff;
+  color: var(--on-text);
 }
 .btn-soft {
   background: var(--surface-2);
@@ -163,7 +222,7 @@ textarea {
   font: inherit;
   color: var(--text);
   background: var(--bg);
-  border: 1px solid #e3e3e3;
+  border: 1px solid var(--border);
   border-radius: 12px;
   padding: 12px 14px;
   transition:
@@ -173,11 +232,50 @@ textarea {
 input:focus,
 textarea:focus {
   outline: none;
-  border-color: #c9c9c9;
-  box-shadow: 0 0 0 4px rgba(0, 0, 0, 0.03);
+  border-color: var(--border-strong);
+  box-shadow: 0 0 0 4px var(--focus-ring);
 }
 ::placeholder {
   color: var(--text-3);
+}
+/* Native select, restyled as a soft pill; the chevron uses currentColor so it follows the theme. */
+select {
+  appearance: none;
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--text);
+  background-color: var(--surface-2);
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position:
+    calc(100% - 17px) 52%,
+    calc(100% - 12px) 52%;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  padding: 7px 34px 7px 12px;
+  cursor: pointer;
+  transition:
+    background-color 0.15s,
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+select:hover:not(:disabled) {
+  background-color: var(--surface-3);
+}
+select:focus-visible {
+  outline: none;
+  border-color: var(--border-strong);
+  box-shadow: 0 0 0 4px var(--focus-ring);
+}
+select:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+select option {
+  background: var(--bg);
+  color: var(--text);
 }
 
 /* ---------- brand ---------- */
@@ -261,7 +359,7 @@ textarea:focus {
 .btn-microsoft {
   background: var(--bg);
   color: var(--text);
-  box-shadow: inset 0 0 0 1px #dcdcdc;
+  box-shadow: inset 0 0 0 1px var(--border);
   gap: 12px;
 }
 .btn-microsoft:hover:not(:disabled) {
@@ -279,7 +377,7 @@ textarea:focus {
   content: '';
   flex: 1;
   height: 1px;
-  background: #e8e8e8;
+  background: var(--line);
 }
 
 /* ---------- shell ---------- */
@@ -428,8 +526,8 @@ textarea:focus {
   width: 30px;
   height: 30px;
   border-radius: 50%;
-  background: #d9ece6;
-  color: #0b6e55;
+  background: var(--avatar-bg);
+  color: var(--accent-text);
   display: grid;
   place-items: center;
   font-size: 13px;
@@ -441,7 +539,7 @@ textarea:focus {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: #c7c7c7;
+  background: var(--muted);
   flex: none;
   display: inline-block;
 }
@@ -484,7 +582,7 @@ textarea:focus {
 .pill-queued,
 .pill-provisioning {
   background: var(--accent-soft);
-  color: #0b6e55;
+  color: var(--accent-text);
 }
 .pill-idle,
 .pill-ready {
@@ -498,7 +596,7 @@ textarea:focus {
 .pill-env-ready,
 .pill-pr-completed {
   background: var(--accent-soft);
-  color: #0b6e55;
+  color: var(--accent-text);
 }
 .pill-env-building,
 .pill-env-deploying {
@@ -565,7 +663,7 @@ textarea:focus {
 }
 .search:focus {
   background: var(--bg);
-  border-color: #dcdcdc;
+  border-color: var(--border);
 }
 .grid {
   display: grid;
@@ -581,9 +679,7 @@ textarea:focus {
   background: var(--bg);
   border-radius: 20px;
   padding: 22px;
-  box-shadow:
-    0 0 0 1px rgba(0, 0, 0, 0.05),
-    0 2px 10px rgba(0, 0, 0, 0.04);
+  box-shadow: var(--card-shadow);
   transition:
     box-shadow 0.18s,
     transform 0.18s;
@@ -591,9 +687,7 @@ textarea:focus {
 .app-card:hover,
 .app-card:focus-visible {
   outline: none;
-  box-shadow:
-    0 0 0 1px rgba(0, 0, 0, 0.06),
-    0 10px 30px rgba(0, 0, 0, 0.08);
+  box-shadow: var(--card-shadow-hover);
   transform: translateY(-2px);
 }
 .app-card-head {
@@ -610,7 +704,7 @@ textarea:focus {
   font-weight: 600;
   font-size: 17px;
   background: var(--accent-soft);
-  color: #0b6e55;
+  color: var(--accent-text);
 }
 .app-card-title {
   font-size: 17px;
@@ -690,7 +784,7 @@ textarea:focus {
   justify-content: center;
   gap: 6px;
   min-height: 248px;
-  border: 1.5px dashed #dadada;
+  border: 1.5px dashed var(--border);
   background: transparent;
   border-radius: 20px;
   cursor: pointer;
@@ -701,7 +795,7 @@ textarea:focus {
 }
 .card-new:hover {
   background: var(--surface);
-  border-color: #c4c4c4;
+  border-color: var(--border-strong);
 }
 .card-new-icon {
   width: 46px;
@@ -804,7 +898,7 @@ textarea:focus {
   border-radius: 26px;
   padding: 8px 8px 8px 18px;
   box-shadow: var(--shadow-md);
-  border: 1px solid rgba(0, 0, 0, 0.05);
+  border: 1px solid var(--hairline);
 }
 .composer textarea,
 .composer .composer-title {
@@ -843,13 +937,13 @@ textarea:focus {
   border: none;
   flex: none;
   background: var(--text);
-  color: #fff;
+  color: var(--on-text);
   display: grid;
   place-items: center;
   cursor: pointer;
 }
 .send-btn:disabled {
-  background: #d7d7d7;
+  background: var(--muted);
   cursor: default;
 }
 
@@ -924,7 +1018,7 @@ textarea:focus {
   left: calc(-50% + 24px);
   height: 2px;
   border-radius: 2px;
-  background: #dedede;
+  background: var(--line);
 }
 .step.done + .step::before,
 .step.done + .step.current::before {
@@ -981,7 +1075,7 @@ textarea:focus {
   50% {
     box-shadow:
       0 0 0 2px var(--accent),
-      0 0 0 11px rgba(16, 163, 127, 0.06);
+      0 0 0 11px var(--accent-glow);
   }
 }
 
@@ -999,7 +1093,7 @@ textarea:focus {
 }
 .notice-error {
   background: var(--red-soft);
-  color: #8f2c2c;
+  color: var(--red-text);
 }
 
 /* ---------- chat ---------- */
@@ -1135,7 +1229,7 @@ textarea:focus {
   border-radius: 6px;
 }
 .markdown pre {
-  background: #f6f6f6;
+  background: var(--code-bg);
   border-radius: 12px;
   padding: 14px 16px;
   overflow-x: auto;
@@ -1213,7 +1307,7 @@ textarea:focus {
 }
 .count {
   font-size: 11.5px;
-  background: rgba(0, 0, 0, 0.07);
+  background: var(--overlay);
   border-radius: 999px;
   padding: 0 7px;
 }
@@ -1286,7 +1380,7 @@ textarea:focus {
   margin-top: 2px;
   display: grid;
   place-items: center;
-  box-shadow: inset 0 0 0 1.5px #d0d0d0;
+  box-shadow: inset 0 0 0 1.5px var(--border-strong);
   color: #fff;
 }
 .todo-completed {
@@ -1319,7 +1413,7 @@ textarea:focus {
   width: 30px;
   height: 18px;
   border-radius: 999px;
-  background: #d6d6d6;
+  background: var(--muted);
   position: relative;
   transition: background 0.15s;
 }
@@ -1362,7 +1456,7 @@ textarea:focus {
   top: 14px;
   bottom: 0;
   width: 1px;
-  background: #e4e4e4;
+  background: var(--line);
 }
 .feed-item:last-child::before {
   display: none;
@@ -1371,7 +1465,7 @@ textarea:focus {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #cfcfcf;
+  background: var(--muted);
   flex: none;
   margin-top: 7px;
   position: relative;
@@ -1522,20 +1616,21 @@ textarea:focus {
   width: 16px;
   height: 16px;
   border-radius: 50%;
-  border: 2px solid rgba(0, 0, 0, 0.12);
+  border: 2px solid var(--border-soft);
   border-top-color: var(--text);
   animation: spin 0.8s linear infinite;
   display: inline-block;
 }
 .spinner.light {
-  border-color: rgba(255, 255, 255, 0.35);
-  border-top-color: #fff;
+  /* sits on dark/light buttons: follow the button's text colour */
+  border-color: color-mix(in srgb, currentColor 35%, transparent);
+  border-top-color: currentColor;
 }
 .spinner.tiny {
   width: 11px;
   height: 11px;
   border-width: 1.5px;
-  border-color: rgba(59, 111, 216, 0.25);
+  border-color: color-mix(in srgb, var(--blue) 25%, transparent);
   border-top-color: var(--blue);
 }
 @keyframes spin {
@@ -1562,9 +1657,7 @@ textarea:focus {
   background: var(--bg);
   border-radius: 16px;
   padding: 14px 14px 14px 16px;
-  box-shadow:
-    0 8px 32px rgba(0, 0, 0, 0.12),
-    0 1px 3px rgba(0, 0, 0, 0.06);
+  box-shadow: var(--shadow-lg);
   animation: rise 0.22s ease-out;
 }
 .toast-icon {
@@ -1697,7 +1790,7 @@ textarea:focus {
   color: var(--red);
 }
 .dot-archived {
-  background: #c7c7c7;
+  background: var(--muted);
 }
 
 .history-run {
@@ -1717,8 +1810,8 @@ textarea:focus {
 .attachment-chip {
   font: inherit;
   font-size: 12px;
-  border: 1px solid rgba(0, 0, 0, 0.12);
-  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid var(--border-soft);
+  background: var(--glass);
   border-radius: 999px;
   padding: 2px 10px;
   cursor: pointer;
@@ -1747,14 +1840,14 @@ textarea:focus {
 }
 .diff-stat .add,
 .diff-patch .add {
-  color: #1a7f37;
+  color: var(--green-text);
 }
 .diff-stat .del,
 .diff-patch .del {
   color: var(--red);
 }
 .diff-patch .hunk {
-  color: #6e7781;
+  color: var(--text-3);
 }
 .diff-patch {
   margin: 8px 0 0;
@@ -1799,8 +1892,8 @@ textarea:focus {
 .chip {
   font: inherit;
   font-size: 13px;
-  border: 1px solid rgba(0, 0, 0, 0.14);
-  background: #fff;
+  border: 1px solid var(--border-soft);
+  background: var(--bg);
   border-radius: 999px;
   padding: 4px 12px;
   cursor: pointer;

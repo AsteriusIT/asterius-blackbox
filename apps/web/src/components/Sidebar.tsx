@@ -1,10 +1,34 @@
+import { useState } from 'react';
 import { LANGS, lang, setLang, t } from '../lib/i18n';
+import { getThemePref, nextThemePref, setThemePref, type ThemePref } from '../lib/theme';
 import type { Application, User } from '../lib/api';
 import { api, auth } from '../lib/api';
 import { phaseLabel } from '../lib/labels';
 import type { Route } from '../App';
 import { Icon } from './Icon';
 import { StatusDot } from './StatusDot';
+
+const THEME_UI: Record<ThemePref, { icon: string; label: string }> = {
+  light: { icon: 'sun', label: 'Light' },
+  dark: { icon: 'moon', label: 'Dark' },
+  system: { icon: 'monitor', label: 'System' },
+};
+
+function ThemeButton() {
+  const [pref, setPref] = useState<ThemePref>(getThemePref);
+  const cycle = () => {
+    const next = nextThemePref(pref);
+    setThemePref(next);
+    setPref(next);
+  };
+  const { icon, label } = THEME_UI[pref];
+  const title = t('Theme: {theme}', { theme: t(label) });
+  return (
+    <button className="icon-btn" title={title} aria-label={title} onClick={cycle}>
+      <Icon name={icon} size={16} />
+    </button>
+  );
+}
 
 export function Sidebar({
   user,
@@ -57,6 +81,7 @@ export function Sidebar({
           {user.name}
           <span className="sidebar-email">{user.email}</span>
         </span>
+        <ThemeButton />
         <button className="icon-btn lang-btn" title={LANGS.find((l) => l.id !== lang)!.label} onClick={() => setLang(lang === 'fr' ? 'en' : 'fr')}>
           {lang === 'fr' ? 'EN' : 'FR'}
         </button>
