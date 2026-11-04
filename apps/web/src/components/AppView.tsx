@@ -109,17 +109,19 @@ export function AppView({ appId, platform, summary }: { appId: string; platform:
         </header>
 
         {app.phase && (
-          <ol className="stepper" aria-label="Progress">
-            {PHASES.map((p, i) => {
-              const state = app.phase === 'done' || i < phaseIdx ? 'done' : i === phaseIdx ? (running ? 'current' : 'done') : 'todo';
-              return (
-                <li key={p.id} className={state}>
-                  <span className="step-dot">{state === 'done' ? <Icon name="check" size={11} /> : null}</span>
-                  {p.label}
-                </li>
-              );
-            })}
-          </ol>
+          <div className="stepper-wrap">
+            <ol className="stepper" aria-label="Progress">
+              {PHASES.map((p, i) => {
+                const state = app.phase === 'done' || i < phaseIdx ? 'done' : i === phaseIdx ? (running ? 'current' : 'done') : 'todo';
+                return (
+                  <li key={p.id} className={`step ${state}`} aria-current={state === 'current' ? 'step' : undefined}>
+                    <span className="step-dot">{state === 'done' ? <Icon name="check" size={15} /> : i + 1}</span>
+                    <span className="step-label">{p.label}</span>
+                  </li>
+                );
+              })}
+            </ol>
+          </div>
         )}
 
         {app.status === 'error' && app.last_error && (

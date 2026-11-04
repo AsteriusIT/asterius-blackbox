@@ -252,13 +252,27 @@ input:focus, textarea:focus { outline: none; border-color: #c9c9c9; box-shadow: 
 .topbar-title h2 { font-size: 17px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .topbar-actions { display: flex; align-items: center; gap: 6px; }
 
-.stepper { list-style: none; display: flex; gap: 22px; margin: 0; padding: 6px 28px 10px; overflow-x: auto; }
-.stepper li { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text-3); white-space: nowrap; }
-.step-dot { width: 16px; height: 16px; border-radius: 50%; background: var(--surface-2); display: grid; place-items: center; color: #fff; flex: none; }
-.stepper li.done { color: var(--text-2); }
-.stepper li.done .step-dot { background: var(--accent); }
-.stepper li.current { color: var(--text); font-weight: 500; }
-.stepper li.current .step-dot { background: var(--accent-soft); box-shadow: inset 0 0 0 4px var(--accent); animation: pulse 1.6s ease-in-out infinite; }
+/* Stepper: large, centered on the chat column, connected steps. */
+.stepper-wrap { padding: 10px 24px 18px; }
+.stepper { list-style: none; margin: 0 auto; padding: 0; max-width: 768px; display: flex; }
+.step { position: relative; flex: 1; display: flex; flex-direction: column; align-items: center; gap: 9px; text-align: center; }
+/* connector to the previous step */
+.step + .step::before {
+  content: ''; position: absolute; top: 17px; right: calc(50% + 24px); left: calc(-50% + 24px);
+  height: 2px; border-radius: 2px; background: #dedede;
+}
+.step.done + .step::before, .step.done + .step.current::before { background: var(--accent); }
+.step-dot {
+  width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; flex: none;
+  font-size: 14px; font-weight: 600; color: var(--text-3); background: var(--surface-2);
+  transition: background 0.2s, color 0.2s, box-shadow 0.2s;
+}
+.step-label { font-size: 13.5px; font-weight: 500; color: var(--text-3); white-space: nowrap; }
+.step.done .step-dot { background: var(--accent); color: #fff; }
+.step.done .step-label { color: var(--text-2); }
+.step.current .step-dot { background: var(--bg); color: var(--accent); box-shadow: 0 0 0 2px var(--accent), 0 0 0 7px var(--accent-soft); animation: step-glow 1.8s ease-in-out infinite; }
+.step.current .step-label { color: var(--text); font-weight: 600; }
+@keyframes step-glow { 0%, 100% { box-shadow: 0 0 0 2px var(--accent), 0 0 0 7px var(--accent-soft); } 50% { box-shadow: 0 0 0 2px var(--accent), 0 0 0 11px rgba(16, 163, 127, 0.06); } }
 
 .notice { display: flex; align-items: center; gap: 10px; margin: 6px 28px; padding: 12px 16px; border-radius: 14px; font-size: 14px; }
 .notice span { flex: 1; }
@@ -406,7 +420,14 @@ input:focus, textarea:focus { outline: none; border-color: #c9c9c9; box-shadow: 
   .app-view.with-panel { grid-template-columns: minmax(0, 1fr) 320px; }
   .examples { grid-template-columns: 1fr; }
 }
+@media (max-width: 1100px) {
+  .step-label { font-size: 12px; }
+  .step-dot { width: 30px; height: 30px; font-size: 13px; }
+  .step + .step::before { top: 14px; right: calc(50% + 20px); left: calc(-50% + 20px); }
+}
 @media (max-width: 820px) {
+  .step-label { display: none; }
+  .step.current .step-label { display: block; position: absolute; top: 40px; }
   .dashboard-inner { padding: 28px 20px; }
   .dash-head { flex-direction: column; align-items: flex-start; }
   .search { width: 100%; }
